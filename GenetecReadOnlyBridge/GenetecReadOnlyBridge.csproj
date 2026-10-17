@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
+    <ProjectGuid>{2A6A41AC-7A0D-43A2-A32B-245F1C5A2D11}</ProjectGuid>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>StamfordVms.GenetecReadOnlyBridge</RootNamespace>
+    <AssemblyName>GenetecReadOnlyBridge</AssemblyName>
+    <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
+    <LangVersion>7.3</LangVersion>
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
+    <DebugSymbols>true</DebugSymbols><DebugType>full</DebugType><Optimize>false</Optimize><OutputPath>bin\Debug\</OutputPath><DefineConstants>DEBUG;TRACE</DefineConstants><WarningLevel>4</WarningLevel>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+    <DebugType>pdbonly</DebugType><Optimize>true</Optimize><OutputPath>bin\Release\</OutputPath><DefineConstants>TRACE</DefineConstants><WarningLevel>4</WarningLevel>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System" /><Reference Include="System.Core" /><Reference Include="System.Data" /><Reference Include="System.Web.Extensions" />
+    <Reference Include="Genetec.Sdk, Version=5.11.0.0, Culture=neutral, PublicKeyToken=a446968a32b751de, processorArchitecture=MSIL">
+      <SpecificVersion>False</SpecificVersion>
+      <HintPath>$(GSC_SDK)\Genetec.Sdk.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup><Compile Include="Program.cs" /><None Include="README.md" /><None Include="Start-Bridge.ps1" /><None Include="Start-Bridge.cmd" /><None Include="Start-Bridge-VisitorSync.cmd" /><None Include="Start-Bridge-VisitorLifecycleTest.cmd" /><None Include="Start-Bridge-Automatically.ps1" /><None Include="Genetec-CredentialStore.ps1" /><None Include="Save-GenetecCredentials.ps1" /><None Include="Test-NativeVisitorSync.ps1" /><None Include="Test-NativeVisitorLookup.ps1" /><None Include="Test-NativeVisitorLifecycle.ps1" /><None Include="Test-NativeVisitorLifecycleState.ps1" /><None Include="Test-BridgeReadOnly.ps1" /></ItemGroup>
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+</Project>

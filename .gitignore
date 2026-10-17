@@ -1,0 +1,41 @@
+# .NET / Visual Studio build products
+**/bin/
+**/obj/
+.vs/
+*.user
+*.suo
+*.cache
+
+# Runtime output and local diagnostics
+*.log
+*.tmp
+*.bak
+
+# Local secrets and credentials - never commit these
+.env
+.env.*
+!.env.example
+**/appsettings.*.local.json
+**/local.settings.json
+**/*.secrets.json
+**/*.secret
+**/*.pfx
+**/*.p12
+**/*.key
+**/*.pem
+**/credentials.txt
+
+# Local exports / scratch work
+artifacts/
+_test-output/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+
+# Python local prototype service / tests
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
