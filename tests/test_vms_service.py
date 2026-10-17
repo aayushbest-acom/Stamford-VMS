@@ -1,10 +1,12 @@
 import json
+import os
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from unittest.mock import patch
 from http.server import ThreadingHTTPServer
 
 from service.vms_service import StateStore, make_handler
@@ -49,7 +51,18 @@ class VmsServiceTests(unittest.TestCase):
         self.assertTrue(body["boundToLoopback"])
         self.assertEqual(body["authentication"], "not-configured")
         self.assertEqual(body["mode"], "prototype-only")
-        self.assertEqual(body["build"], "5.1.6")
+        self.assertEqual(body["build"], "5.2.1")
+
+    def test_face_attendance_feature_is_gated_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            code, status = self.request("GET", "/api/v1/face-attendance/status")
+            self.assertEqual(code, 200)
+            self.assertFalse(status["studentFaceAttendanceEnabled"])
+            self.assertFalse(status["groupFaceIdentificationEnabled"])
+            self.assertTrue(status["recognitionResultRequiresHumanConfirmation"])
+            code, result = self.request("GET", "/api/v1/face-attendance/students")
+            self.assertEqual(code, 403)
+            self.assertEqual(result["error"], "FACE_ATTENDANCE_DISABLED")
 
     def test_state_round_trip_and_revision(self):
         code, initial = self.request("GET", "/api/v1/state")

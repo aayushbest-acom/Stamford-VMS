@@ -1,0 +1,4 @@
+# OPTIONAL BIOMETRIC DEPENDENCY — install only after Stamford's written approval.
+# Provides cv2.face.LBPHFaceRecognizer for the local-only experimental matcher.
+# This package replaces opencv-python-headless; do not install both OpenCV wheels together.
+opencv-contrib-python-headless>=4.10,<5

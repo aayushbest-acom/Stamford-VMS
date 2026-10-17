@@ -19,7 +19,7 @@ import sqlite3
 import sys
 import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit, unquote
+from urllib.parse import urlsplit, unquote, parse_qs
 
 try:
     from .qr_frame_decoder import decode_qr_data_url, QRDecoderUnavailable
@@ -31,7 +31,12 @@ try:
 except ImportError:  # direct script execution
     from domain import DomainError, DomainStore
 
-MAX_BODY_BYTES = 2 * 1024 * 1024
+try:
+    from .face_attendance import FaceAttendanceError, FaceAttendanceStore
+except ImportError:  # direct script execution
+    from face_attendance import FaceAttendanceError, FaceAttendanceStore
+
+MAX_BODY_BYTES = 4 * 1024 * 1024
 SCHEMA_VERSION = 1
 STATE_LIMITS = {
     "visits": 5000,
@@ -140,12 +145,13 @@ def validate_snapshot(payload: object) -> tuple[int, dict]:
     return revision, normalized
 
 
-def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | None = None):
+def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | None = None, face_store: FaceAttendanceStore | None = None):
     ui_dir = ui_dir.resolve()
     domain_store = domain_store or DomainStore(store.db_path)
+    face_store = face_store or FaceAttendanceStore(store.db_path.with_name("face-attendance.sqlite3"))
 
     class Handler(SimpleHTTPRequestHandler):
-        server_version = "StamfordVMSPrototype/5.1.6"
+        server_version = "StamfordVMSPrototype/5.2.1"
         sys_version = ""
 
         def __init__(self, *args, **kwargs):
@@ -191,6 +197,11 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
             payload.update(exc.extra)
             self._send_json(exc.status, payload)
 
+        def _send_face_error(self, exc: FaceAttendanceError):
+            payload = {"ok": False, "error": exc.code, "message": exc.message}
+            payload.update(exc.extra)
+            self._send_json(exc.status, payload)
+
         def _request_allowed(self) -> bool:
             host_header = self.headers.get("Host", "")
             parsed_host = urlsplit("//" + host_header)
@@ -225,7 +236,7 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
                 return
             path = urlsplit(self.path).path
             if path == "/api/v1/health":
-                self._send_json(200, {"ok": True, "service": "Stamford VMS local prototype service", "build": "5.1.6", "schoolTimeZone": "Asia/Singapore", "mode": "prototype-only", "persistence": "sqlite-local", "authentication": "not-configured", "boundToLoopback": True})
+                self._send_json(200, {"ok": True, "service": "Stamford VMS local prototype service", "build": "5.2.1", "schoolTimeZone": "Asia/Singapore", "mode": "prototype-only", "persistence": "sqlite-local", "authentication": "not-configured", "boundToLoopback": True})
                 return
             if path == "/api/v1/state":
                 try:
@@ -252,6 +263,45 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
                 except Exception:
                     logging.exception("Unable to read domain visit")
                     self._send_json(500, {"ok": False, "error": "VISIT_READ_FAILED", "message": "Domain visit could not be loaded."})
+                return
+            if path == "/api/v1/face-attendance/status":
+                try:
+                    self._send_json(200, face_store.status())
+                except Exception:
+                    logging.exception("Unable to inspect face-attendance feature status")
+                    self._send_json(500, {"ok": False, "error": "FACE_STATUS_FAILED", "message": "Face-attendance status could not be read."})
+                return
+            if path == "/api/v1/face-attendance/students":
+                try:
+                    self._send_json(200, face_store.list_students())
+                except FaceAttendanceError as exc:
+                    self._send_face_error(exc)
+                except Exception:
+                    logging.exception("Unable to list consented face enrollments")
+                    self._send_json(500, {"ok": False, "error": "FACE_STUDENT_LIST_FAILED", "message": "The enrolled-student list could not be loaded."})
+                return
+            if path == "/api/v1/face-attendance/genetec-cardholders":
+                try:
+                    query = parse_qs(urlsplit(self.path).query)
+                    search = (query.get("search") or [None])[0]
+                    self._send_json(200, face_store.list_genetec_cardholders(search))
+                except FaceAttendanceError as exc:
+                    self._send_face_error(exc)
+                except Exception:
+                    logging.exception("Unable to search Genetec Cardholders for approved biometric import")
+                    self._send_json(500, {"ok": False, "error": "GENETEC_CARDHOLDER_SEARCH_FAILED", "message": "Genetec Cardholder search failed; inspect the local bridge status."})
+                return
+            if path == "/api/v1/face-attendance/events":
+                query = parse_qs(urlsplit(self.path).query)
+                try:
+                    session_id = (query.get("sessionId") or [None])[0]
+                    group_event_id = (query.get("groupEventId") or [""])[0]
+                    self._send_json(200, face_store.list_events(session_id, group_event_id))
+                except FaceAttendanceError as exc:
+                    self._send_face_error(exc)
+                except Exception:
+                    logging.exception("Unable to list face-attendance events")
+                    self._send_json(500, {"ok": False, "error": "FACE_EVENTS_FAILED", "message": "Attendance events could not be loaded."})
                 return
             # The built-in static server only serves files below ui_dir.
             return super().do_GET()
@@ -343,9 +393,33 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
                     event_id = payload.get("eventId") if isinstance(payload, dict) else None
                     self._send_json(200, domain_store.transition_by_qr(token, action, event_id))
                     return
+                if path == "/api/v1/face-attendance/enroll":
+                    self._send_json(201, face_store.enroll(payload))
+                    return
+                if path == "/api/v1/face-attendance/enroll-from-genetec":
+                    self._send_json(201, face_store.enroll_from_genetec(payload))
+                    return
+                match = re.fullmatch(r"/api/v1/face-attendance/students/([^/]+)/revoke", path)
+                if match:
+                    self._send_json(200, face_store.revoke_enrollment(unquote(match.group(1)), payload))
+                    return
+                if path == "/api/v1/face-attendance/match":
+                    self._send_json(200, face_store.match_student(payload))
+                    return
+                if path == "/api/v1/face-attendance/confirm":
+                    self._send_json(200, face_store.confirm_student(payload))
+                    return
+                if path == "/api/v1/face-attendance/group-match":
+                    self._send_json(200, face_store.match_group(payload))
+                    return
+                if path == "/api/v1/face-attendance/group-confirm-batch":
+                    self._send_json(200, face_store.confirm_group_batch(payload))
+                    return
                 self._send_json(404, {"ok": False, "error": "NOT_FOUND", "message": "No API route matches this request."})
             except DomainError as exc:
                 self._send_domain_error(exc)
+            except FaceAttendanceError as exc:
+                self._send_face_error(exc)
             except Exception:
                 # Never log request bodies; they can contain raw QR tokens.
                 logging.exception("Domain API request failed for route %s", path[:100])
@@ -384,6 +458,7 @@ def main(argv=None) -> int:
         logging.info("Serving Stamford VMS prototype at http://%s:%s", args.host, args.port)
         logging.info("Local SQLite database: %s", args.data_dir / "prototype-state.sqlite3")
         logging.info("Domain API routes: POST /api/v1/visits, POST /api/v1/qr/decode-frame, POST /api/v1/qr/validate, POST /api/v1/qr/check-in, POST /api/v1/qr/check-out, POST /api/v1/qr/svg")
+        logging.info("Optional gated face attendance API: GET /api/v1/face-attendance/status; POST /api/v1/face-attendance/enroll|match|confirm|group-match|group-confirm-batch")
         logging.warning("PROTOTYPE ONLY: no enterprise authentication/authorization; use synthetic data only; do not expose beyond loopback")
         logging.info("Press Ctrl+C to stop")
         try:

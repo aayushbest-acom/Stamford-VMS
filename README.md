@@ -120,3 +120,21 @@ See `docs/MILESTONE5.1.5-INVITATION-SYNC-TIMING.md` for the current invitation-s
 When a server-backed synthetic visit has both local arrival and departure recorded but the Genetec check-in event is still Pending/Failed, visit details now selects the original check-in event as the next action. It explains that Genetec must independently verify check-in before checkout, permits replay of the saved check-in event after local checkout only when both original events exist and are ordered correctly, and refuses recovery if the event is older than the bridge's 30-minute new-event window. After the check-in is read-back verified, reopening visit details selects the original checkout event. Event IDs and timestamps are preserved; no synthetic timestamp is invented.
 
 The lifecycle sync UI no longer applies the just-completed event's state to a newly rendered next-event button. This avoids disabling the checkout retry after a successful prerequisite check-in. The sequence remains separately confirmed native Genetec writes and should be exercised only with synthetic visits on an approved non-production Directory.
+
+
+## Build 5.2.0 — gated student face-attendance prototype
+
+Build 5.2.0 adds an optional Student attendance page and a local OpenCV-contrib LBPH matching service. It is disabled by default and requires both `STAMFORD_FACE_ATTENDANCE_ENABLED=1` and `STAMFORD_BIOMETRIC_POLICY_APPROVED=1`. Enrollment requires recorded student/guardian consent and an approval reference; samples must be individual captures, are encrypted with Windows DPAPI CurrentUser and are not stored as raw camera frames. Matching creates only a short-lived candidate ticket: staff must explicitly confirm every attendance event. Check-out cannot be recorded without a check-in in the same session.
+
+Group event face matching has an additional `STAMFORD_GROUP_FACE_IDENTIFICATION_APPROVED=1` gate because identity matching from group photos is excluded from the current baseline unless separately approved. When enabled, matching is limited to a supplied roster of already enrolled/consented people; group images are not saved or used to enroll people; unmatched faces remain for manual reconciliation. This feature records into a local attendance ledger and does not modify Genetec access rights or create Genetec student attendance events.
+
+The OpenCV-contrib recognizer is experimental. Distance is not a probability, no liveness/spoof defence is supplied, and threshold/false-match testing is mandatory before any controlled pilot. The service still lacks application authentication/RBAC; use synthetic identities only. See `docs/BIOMETRIC-ATTENDANCE-CHANGE-REQUEST.md`.
+
+
+## Build 5.2.1 — Genetec Cardholder photo and credential-reference sync
+
+The local loopback bridge now supports gated, read-only Cardholder search and retrieval of an individually assigned Cardholder portrait from Genetec. The VMS can combine that portrait with separate live individual camera captures during approved enrollment, retain the native Cardholder GUID and masked credential-reference metadata, and associate later human-confirmed attendance records with that Cardholder. It does not write attendance records or modify Genetec Cardholders, credentials, credential numbers, groups, or access rights.
+
+The additional flag `STAMFORD_GENETEC_CARDHOLDER_FACE_SYNC_APPROVED=1` is required in both the Python service and Genetec bridge processes, alongside the existing student face-attendance and biometric policy gates. All three remain off by default. Raw card numbers are masked by the bridge and rejected by the service if they are not masked. The selected Genetec portrait and camera captures are processed in memory; only encrypted face crops are retained using Windows DPAPI CurrentUser. A staff member must confirm every match before attendance is written to the local ledger.
+
+See `docs/GENETEC-CARDHOLDER-FACE-SYNC.md`. This remains a gated prototype, not a production biometric attendance product. The precise Cardholder picture property and credential mapping must be verified against the installed Security Center 5.11 SDK on the target Windows host.

@@ -170,18 +170,18 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("function navigate(v){if(currentView==='kiosk'&&v!=='kiosk')stopQrCamera(false)", self.ui)
 
     def test_milestone_511_build_marker_and_stale_build_prevention(self):
-        self.assertIn('meta name="vms-build" content="5.1.6"', self.ui)
-        self.assertIn('UI BUILD 5.1.6', self.ui)
-        self.assertIn("const VMS_BUILD='5.1.6'", self.ui)
+        self.assertIn('meta name="vms-build" content="5.2.1"', self.ui)
+        self.assertIn('UI BUILD 5.2.1', self.ui)
+        self.assertIn("const VMS_BUILD='5.2.1'", self.ui)
         self.assertNotIn('Planned visit window', self.ui)
         self.assertNotIn('A USB QR scanner that types into a field', self.ui)
         launcher = (ROOT / "Start-Demo.cmd").read_text(encoding="utf-8")
-        self.assertIn("BUILD 5.1.6", launcher)
+        self.assertIn("BUILD 5.2.1", launcher)
         self.assertIn("PORT_IN_USE", launcher)
         self.assertIn("previous VMS instance", launcher)
         service = (ROOT / "service" / "vms_service.py").read_text(encoding="utf-8")
-        self.assertIn('"build": "5.1.6"', service)
-        self.assertIn("StamfordVMSPrototype/5.1.6", service)
+        self.assertIn('"build": "5.2.1"', service)
+        self.assertIn("StamfordVMSPrototype/5.2.1", service)
         self.assertIn('Cache-Control", "no-store, no-cache, must-revalidate, max-age=0', service)
 
     def test_checkout_recovery_requires_readback_verified_checkin_first(self):
@@ -197,6 +197,44 @@ class RepositoryContractTests(unittest.TestCase):
         # Success rerenders the next event button (checkout); a finally block must
         # not accidentally disable it based on the just-completed check-in record.
         self.assertNotIn("retry.disabled=!(lastBridgeResponse.connected===true", self.ui)
+
+    def test_face_attendance_is_opt_in_and_group_photo_enrollment_is_blocked(self):
+        face = (ROOT / "service" / "face_attendance.py").read_text(encoding="utf-8")
+        self.assertIn('STAMFORD_FACE_ATTENDANCE_ENABLED', face)
+        self.assertIn('STAMFORD_BIOMETRIC_POLICY_APPROVED', face)
+        self.assertIn('STAMFORD_GROUP_FACE_IDENTIFICATION_APPROVED', face)
+        self.assertIn('GROUP_PHOTO_ENROLLMENT_BLOCKED', face)
+        self.assertIn('groupImagePersisted', face)
+        self.assertIn('humanConfirmationRequired', face)
+        self.assertIn('CHECKIN_REQUIRED', face)
+        self.assertIn('CryptProtectData', face)
+        self.assertIn('CryptUnprotectData', face)
+        ui = self.ui
+        self.assertIn('id="view-attendance"', ui)
+        self.assertIn('Student attendance', ui)
+        self.assertIn('matchGroupFaces()', ui)
+        self.assertIn('confirmGroupFaceAttendance()', ui)
+        self.assertIn('studentId', ui)
+
+    def test_genetec_cardholder_face_import_is_read_only_and_approval_gated(self):
+        face = (ROOT / "service" / "face_attendance.py").read_text(encoding="utf-8")
+        service = (ROOT / "service" / "vms_service.py").read_text(encoding="utf-8")
+        project = (ROOT / "GenetecReadOnlyBridge" / "GenetecReadOnlyBridge.csproj").read_text(encoding="utf-8")
+        self.assertIn('"/api/genetec/cardholders"', self.bridge)
+        self.assertIn('"/api/genetec/cardholder-photo"', self.bridge)
+        self.assertIn("RequireCardholderFaceSyncApproval()", self.bridge)
+        self.assertIn("MaskCredentialIdentifier(rawIdentifier)", self.bridge)
+        self.assertIn("rawCredentialNumbersReturned = false", self.bridge)
+        self.assertIn("STAMFORD_GENETEC_CARDHOLDER_FACE_SYNC_APPROVED", face)
+        self.assertIn("GENETEC_CARDHOLDER_FACE_SYNC_DISABLED", face)
+        self.assertIn("/api/v1/face-attendance/genetec-cardholders", service)
+        self.assertIn("/api/v1/face-attendance/enroll-from-genetec", service)
+        self.assertIn("CryptProtectData", face)
+        self.assertIn("genetec_cardholder_guid", face)
+        self.assertIn("genetec_credential_refs_json", face)
+        self.assertIn('Reference Include="System.Drawing"', project)
+        self.assertIn("Read-only Genetec Cardholder import", self.ui)
+        self.assertIn("enrollFaceStudentFromGenetec()", self.ui)
 
     def test_secure_qr_tokens_are_removed_from_browser_snapshot(self):
         self.assertIn('function demoStateSnapshot()', self.ui)

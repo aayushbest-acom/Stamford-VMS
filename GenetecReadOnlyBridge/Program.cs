@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Data;
 using System.IO;
 using System.Globalization;
+using System.Drawing;
+using System.Drawing.Imaging;
 using System.Text.RegularExpressions;
 using System.Linq;
 using System.Net;
@@ -21,7 +23,7 @@ namespace StamfordVms.GenetecReadOnlyBridge
     internal static class Program
     {
         private const string Prefix = "http://127.0.0.1:5190/";
-        private const string BridgeBuild = "5.1.6";
+        private const string BridgeBuild = "5.2.1";
         private const string TestWriteConfirmation = "CREATE_ONLY_STAMFORD_VMS_TEST_CARDHOLDER";
         private const string VisitorSyncConfirmation = "SYNC_SYNTHETIC_STAMFORD_VMS_VISITOR";
         private const string VisitorLifecycleConfirmation = "SYNC SYNTHETIC STAMFORD VMS VISITOR LIFECYCLE";
@@ -52,6 +54,8 @@ namespace StamfordVms.GenetecReadOnlyBridge
                     listener.Start();
                     Console.WriteLine("Stamford VMS Genetec bridge build " + BridgeBuild + " is listening on " + Prefix);
                     Console.WriteLine("Endpoints: GET /api/health, GET /api/genetec/status, GET /api/genetec/capabilities");
+                    Console.WriteLine("Approved read-only Cardholder search: GET /api/genetec/cardholders?search=Name&limit=25 (feature and privacy gates required)");
+                    Console.WriteLine("Approved read-only Cardholder photo/credential references: GET /api/genetec/cardholder-photo?cardholderGuid=<GUID> (photo never saved by bridge)");
                     Console.WriteLine("Read-only Visitor key lookup: GET /api/genetec/visitor-booking-lookup?bookingId=VMS-SDKTEST-01");
                     Console.WriteLine("Read-only lifecycle state inspection: GET /api/genetec/visitor-lifecycle-state?bookingId=VMS-SDKTEST-01");
                     Console.WriteLine("Guarded local-ledger reconciliation (no Genetec writes): POST /api/genetec/visitor-lifecycle-reconcile-checkout");
@@ -220,6 +224,46 @@ namespace StamfordVms.GenetecReadOnlyBridge
                         ? "A non-production Visitor lifecycle round-trip has completed with independent read-back."
                         : "Lifecycle SDK members are available. End-to-end check-in/check-out read-back is not yet validated on this Directory; use only the gated synthetic test."
                 };
+            }
+            else if (String.Equals(request.HttpMethod, "GET", StringComparison.OrdinalIgnoreCase) &&
+                String.Equals(path, "/api/genetec/cardholders", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    payload = ReadGenetecCardholders(request.QueryString["search"], request.QueryString["limit"]);
+                    statusCode = 200;
+                }
+                catch (BridgeException ex)
+                {
+                    statusCode = ex.HttpStatusCode;
+                    payload = new { success = false, errorCode = ex.Code, error = ex.Message, checkedAtUtc = DateTime.UtcNow.ToString("o") };
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("Read-only Cardholder search failed: " + ex.GetType().Name);
+                    statusCode = 503;
+                    payload = new { success = false, errorCode = "CARDHOLDER_SEARCH_FAILED", error = "Could not read Cardholder metadata from Genetec. Check bridge logs; no Genetec write was attempted.", checkedAtUtc = DateTime.UtcNow.ToString("o") };
+                }
+            }
+            else if (String.Equals(request.HttpMethod, "GET", StringComparison.OrdinalIgnoreCase) &&
+                String.Equals(path, "/api/genetec/cardholder-photo", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    payload = ReadGenetecCardholderPhoto(request.QueryString["cardholderGuid"]);
+                    statusCode = 200;
+                }
+                catch (BridgeException ex)
+                {
+                    statusCode = ex.HttpStatusCode;
+                    payload = new { success = false, errorCode = ex.Code, error = ex.Message, checkedAtUtc = DateTime.UtcNow.ToString("o") };
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("Read-only Cardholder photo sync failed: " + ex.GetType().Name);
+                    statusCode = 503;
+                    payload = new { success = false, errorCode = "CARDHOLDER_PHOTO_READ_FAILED", error = "Could not read this Cardholder's picture through the installed SDK. No image was saved and no Genetec write was attempted.", checkedAtUtc = DateTime.UtcNow.ToString("o") };
+                }
             }
             else if (String.Equals(request.HttpMethod, "GET", StringComparison.OrdinalIgnoreCase) &&
                 String.Equals(path, "/api/genetec/visitor-booking-lookup", StringComparison.OrdinalIgnoreCase))
@@ -476,6 +520,328 @@ namespace StamfordVms.GenetecReadOnlyBridge
             WriteJson(response, statusCode, payload);
         }
 
+        private static bool IsCardholderFaceSyncApproved()
+        {
+            return IsEnvEnabled("STAMFORD_FACE_ATTENDANCE_ENABLED") &&
+                IsEnvEnabled("STAMFORD_BIOMETRIC_POLICY_APPROVED") &&
+                IsEnvEnabled("STAMFORD_GENETEC_CARDHOLDER_FACE_SYNC_APPROVED");
+        }
+
+        private static bool IsEnvEnabled(string name)
+        {
+            string value = Environment.GetEnvironmentVariable(name);
+            return String.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
+                String.Equals(value, "true", StringComparison.OrdinalIgnoreCase) ||
+                String.Equals(value, "yes", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static void RequireCardholderFaceSyncApproval()
+        {
+            if (!IsCardholderFaceSyncApproved())
+            {
+                throw new BridgeException(403, "GENETEC_CARDHOLDER_FACE_SYNC_DISABLED",
+                    "Cardholder image/credential-reference sync is disabled. It requires STAMFORD_FACE_ATTENDANCE_ENABLED=1, STAMFORD_BIOMETRIC_POLICY_APPROVED=1, and STAMFORD_GENETEC_CARDHOLDER_FACE_SYNC_APPROVED=1 after written school approval.");
+            }
+        }
+
+        private static object ReadGenetecCardholders(string search, string limitText)
+        {
+            RequireCardholderFaceSyncApproval();
+            search = (search ?? String.Empty).Trim();
+            if (search.Length < 2 || search.Length > 80)
+                throw new BridgeException(400, "CARDHOLDER_SEARCH_REQUIRED", "Enter at least two characters to search Genetec Cardholders. Broad, unfiltered directory export is not supported.");
+            int limit;
+            if (!Int32.TryParse(limitText, out limit)) limit = 25;
+            if (limit < 1 || limit > 50) limit = 25;
+
+            using (var engine = ConnectToGenetec())
+            {
+                try
+                {
+                    var query = engine.ReportManager.CreateReportQuery(ReportType.CardholderConfiguration) as EntityConfigurationQuery;
+                    if (query == null)
+                        throw new BridgeException(503, "CARDHOLDER_QUERY_UNAVAILABLE", "The SDK did not create a Cardholder configuration query.");
+                    query.EntityTypeFilter.Add(EntityType.Cardholder);
+                    var result = query.Query();
+                    if (result == null || !result.Success || result.Data == null)
+                        throw new BridgeException(503, "CARDHOLDER_QUERY_FAILED", "The Cardholder configuration query failed; no write was attempted.");
+
+                    var found = new List<object>();
+                    int scanned = 0;
+                    foreach (DataRow row in result.Data.Rows)
+                    {
+                        if (row.ItemArray.Length == 0 || !(row[0] is Guid)) continue;
+                        scanned++;
+                        if (scanned > 10000)
+                            throw new BridgeException(413, "CARDHOLDER_SEARCH_SCOPE_TOO_LARGE", "The directory search exceeded the 10,000-entity safety cap. Narrow the search or use an approved directory filter.");
+                        var cardholder = engine.GetEntity((Guid)row[0]) as Cardholder;
+                        if (cardholder == null) continue;
+                        string firstName = cardholder.FirstName ?? String.Empty;
+                        string lastName = cardholder.LastName ?? String.Empty;
+                        string displayName = (firstName + " " + lastName).Trim();
+                        if (String.IsNullOrWhiteSpace(displayName)) displayName = cardholder.Name ?? String.Empty;
+                        string externalId = GetFirstStringProperty(cardholder, new[] { "StudentId", "ExternalId", "ExternalID", "UniqueId", "UniqueID", "PersonnelId", "EmployeeId" });
+                        bool matches = displayName.IndexOf(search, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            (!String.IsNullOrWhiteSpace(externalId) && externalId.IndexOf(search, StringComparison.OrdinalIgnoreCase) >= 0) ||
+                            (!String.IsNullOrWhiteSpace(cardholder.Name) && cardholder.Name.IndexOf(search, StringComparison.OrdinalIgnoreCase) >= 0);
+                        if (!matches) continue;
+                        found.Add(new
+                        {
+                            cardholderGuid = cardholder.Guid.ToString("D"),
+                            displayName = displayName,
+                            firstName = firstName,
+                            lastName = lastName,
+                            externalId = externalId,
+                            photoAvailable = HasCardholderPicture(cardholder),
+                            credentialReferences = ReadCredentialReferences(cardholder, engine)
+                        });
+                        if (found.Count >= limit) break;
+                    }
+                    return new
+                    {
+                        success = true,
+                        mode = "read-only-genetec-cardholder-search",
+                        resultsLimited = true,
+                        search = search,
+                        returnedCount = found.Count,
+                        cardholders = found,
+                        rawCredentialNumbersReturned = false,
+                        imageBytesReturned = false,
+                        writeAttempted = false,
+                        checkedAtUtc = DateTime.UtcNow.ToString("o")
+                    };
+                }
+                catch (BridgeException) { throw; }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("Cardholder search query failed: " + ex.GetType().Name);
+                    throw new BridgeException(503, "CARDHOLDER_SEARCH_FAILED", "The read-only Cardholder query failed. Review the local bridge log; no write was attempted.");
+                }
+                finally { try { engine.LogOff(); } catch { } }
+            }
+        }
+
+        private static object ReadGenetecCardholderPhoto(string cardholderGuidText)
+        {
+            RequireCardholderFaceSyncApproval();
+            Guid cardholderGuid;
+            if (!Guid.TryParse(cardholderGuidText, out cardholderGuid))
+                throw new BridgeException(400, "INVALID_CARDHOLDER_GUID", "cardholderGuid must be the GUID returned by the Genetec Cardholder search.");
+
+            using (var engine = ConnectToGenetec())
+            {
+                try
+                {
+                    var cardholder = engine.GetEntity(cardholderGuid) as Cardholder;
+                    if (cardholder == null)
+                        throw new BridgeException(404, "CARDHOLDER_NOT_FOUND", "The selected Genetec Cardholder no longer exists or is not readable.");
+                    byte[] imageBytes = GetCardholderPictureBytes(cardholder);
+                    if (imageBytes == null || imageBytes.Length == 0)
+                        throw new BridgeException(422, "CARDHOLDER_PHOTO_UNAVAILABLE", "The selected Genetec Cardholder has no picture readable through the installed SDK. Import cannot continue without an individually assigned portrait.");
+                    if (imageBytes.Length > 1800000)
+                        throw new BridgeException(413, "CARDHOLDER_PHOTO_TOO_LARGE", "The selected Cardholder picture is larger than the 1.8 MB local import limit.");
+                    string mime = DetectImageMime(imageBytes);
+                    if (mime == null)
+                        throw new BridgeException(415, "CARDHOLDER_PHOTO_FORMAT_UNSUPPORTED", "The SDK returned a picture in an unsupported format. Use a JPEG or PNG picture in Genetec.");
+
+                    string firstName = cardholder.FirstName ?? String.Empty;
+                    string lastName = cardholder.LastName ?? String.Empty;
+                    string displayName = (firstName + " " + lastName).Trim();
+                    if (String.IsNullOrWhiteSpace(displayName)) displayName = cardholder.Name ?? String.Empty;
+                    return new
+                    {
+                        success = true,
+                        mode = "read-only-genetec-cardholder-photo",
+                        cardholder = new
+                        {
+                            cardholderGuid = cardholder.Guid.ToString("D"),
+                            displayName = displayName,
+                            firstName = firstName,
+                            lastName = lastName,
+                            externalId = GetFirstStringProperty(cardholder, new[] { "StudentId", "ExternalId", "ExternalID", "UniqueId", "UniqueID", "PersonnelId", "EmployeeId" }),
+                            credentialReferences = ReadCredentialReferences(cardholder, engine)
+                        },
+                        imageMimeType = mime,
+                        imageBase64 = Convert.ToBase64String(imageBytes),
+                        rawCredentialNumbersReturned = false,
+                        persistedByBridge = false,
+                        writeAttempted = false,
+                        checkedAtUtc = DateTime.UtcNow.ToString("o")
+                    };
+                }
+                catch (BridgeException) { throw; }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("Cardholder photo query failed: " + ex.GetType().Name);
+                    throw new BridgeException(503, "CARDHOLDER_PHOTO_READ_FAILED", "Could not read the Cardholder picture through this installed SDK build. Inspect the local bridge log; no Genetec write was attempted.");
+                }
+                finally { try { engine.LogOff(); } catch { } }
+            }
+        }
+
+        private static string GetFirstStringProperty(object target, IEnumerable<string> names)
+        {
+            foreach (string name in names)
+            {
+                string value = GetStringProperty(target, name);
+                if (!String.IsNullOrWhiteSpace(value) && value.Length <= 160) return value.Trim();
+            }
+            return null;
+        }
+
+        private static object GetPropertyValue(object target, string name)
+        {
+            if (target == null) return null;
+            try
+            {
+                var property = target.GetType().GetProperty(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.FlattenHierarchy);
+                return property == null || property.GetIndexParameters().Length != 0 ? null : property.GetValue(target, null);
+            }
+            catch { return null; }
+        }
+
+        private static object GetCardholderPictureObject(Cardholder cardholder)
+        {
+            foreach (string name in new[] { "Picture", "Photo", "Image", "PictureData", "PhotoData", "ImageData" })
+            {
+                object value = GetPropertyValue(cardholder, name);
+                if (value != null) return value;
+            }
+            foreach (string methodName in new[] { "GetPicture", "GetPhoto", "GetPictureData", "GetPhotoData", "GetImage" })
+            {
+                try
+                {
+                    MethodInfo method = cardholder.GetType().GetMethod(methodName, BindingFlags.Instance | BindingFlags.Public, null, Type.EmptyTypes, null);
+                    if (method == null) continue;
+                    object value = method.Invoke(cardholder, null);
+                    if (value != null) return value;
+                }
+                catch { }
+            }
+            return null;
+        }
+
+        private static bool HasCardholderPicture(Cardholder cardholder)
+        {
+            object value = GetCardholderPictureObject(cardholder);
+            if (value is byte[]) return ((byte[])value).Length > 0;
+            if (value is string) return ((string)value).Length > 100;
+            return value != null;
+        }
+
+        private static byte[] GetCardholderPictureBytes(Cardholder cardholder)
+        {
+            return ConvertPictureValue(GetCardholderPictureObject(cardholder), 0);
+        }
+
+        private static byte[] ConvertPictureValue(object value, int depth)
+        {
+            if (value == null || depth > 3) return null;
+            if (value is byte[])
+            {
+                var bytes = (byte[])value;
+                return bytes.Length <= 1800000 ? bytes : null;
+            }
+            if (value is System.Drawing.Image)
+            {
+                using (var ms = new MemoryStream())
+                {
+                    ((System.Drawing.Image)value).Save(ms, ImageFormat.Jpeg);
+                    return ms.Length <= 1800000 ? ms.ToArray() : null;
+                }
+            }
+            if (value is System.IO.Stream)
+            {
+                var stream = (System.IO.Stream)value;
+                try { if (stream.CanSeek) stream.Position = 0; } catch { }
+                using (var ms = new MemoryStream())
+                {
+                    var buffer = new byte[8192]; int read;
+                    while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+                    {
+                        if (ms.Length + read > 1800000) return null;
+                        ms.Write(buffer, 0, read);
+                    }
+                    return ms.ToArray();
+                }
+            }
+            if (value is string)
+            {
+                string text = ((string)value).Trim();
+                int comma = text.IndexOf("base64,", StringComparison.OrdinalIgnoreCase);
+                if (comma >= 0) text = text.Substring(comma + 7);
+                if (text.Length < 100 || text.Length > 2500000) return null;
+                try { var bytes = Convert.FromBase64String(text); return bytes.Length <= 1800000 ? bytes : null; }
+                catch { return null; }
+            }
+            foreach (string methodName in new[] { "ToByteArray", "GetBytes", "GetImageBytes", "ToBitmap", "GetBitmap", "GetImage" })
+            {
+                try
+                {
+                    MethodInfo method = value.GetType().GetMethod(methodName, BindingFlags.Instance | BindingFlags.Public, null, Type.EmptyTypes, null);
+                    if (method == null) continue;
+                    object nested = method.Invoke(value, null);
+                    if (nested == null || Object.ReferenceEquals(nested, value)) continue;
+                    var bytes = ConvertPictureValue(nested, depth + 1);
+                    if (bytes != null) return bytes;
+                }
+                catch { }
+            }
+            foreach (string propertyName in new[] { "Data", "Bytes", "ImageData", "PictureData", "Content", "Buffer", "Bitmap", "Image", "Picture", "Value" })
+            {
+                object nested = GetPropertyValue(value, propertyName);
+                if (nested == null || Object.ReferenceEquals(nested, value)) continue;
+                var bytes = ConvertPictureValue(nested, depth + 1);
+                if (bytes != null) return bytes;
+            }
+            return null;
+        }
+
+        private static string DetectImageMime(byte[] bytes)
+        {
+            if (bytes == null || bytes.Length < 12) return null;
+            if (bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) return "image/jpeg";
+            if (bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47) return "image/png";
+            if (bytes[0] == 0x52 && bytes[1] == 0x49 && bytes[2] == 0x46 && bytes[3] == 0x46 && bytes[8] == 0x57 && bytes[9] == 0x45 && bytes[10] == 0x42 && bytes[11] == 0x50) return "image/webp";
+            return null;
+        }
+
+        private static object ReadCredentialReferences(Cardholder cardholder, Engine engine)
+        {
+            var result = new List<object>();
+            object value = GetPropertyValue(cardholder, "Credentials");
+            var enumerable = value as System.Collections.IEnumerable;
+            if (enumerable == null) return result;
+            foreach (object item in enumerable)
+            {
+                if (item == null || result.Count >= 20) continue;
+                object credential = item;
+                if (item is Guid) credential = engine.GetEntity((Guid)item) ?? item;
+                string guid = null;
+                object guidValue = GetPropertyValue(credential, "Guid");
+                if (guidValue is Guid) guid = ((Guid)guidValue).ToString("D");
+                else if (guidValue != null && Guid.TryParse(Convert.ToString(guidValue, CultureInfo.InvariantCulture), out Guid parsed)) guid = parsed.ToString("D");
+                if (String.IsNullOrWhiteSpace(guid) && item is Guid) guid = ((Guid)item).ToString("D");
+                string name = GetFirstStringProperty(credential, new[] { "CredentialType", "TypeName", "Type" }) ?? "Assigned credential";
+                string rawIdentifier = GetFirstStringProperty(credential, new[] { "CredentialNumber", "CardNumber", "Number", "Code", "Identifier", "Value" });
+                string masked = MaskCredentialIdentifier(rawIdentifier);
+                object activeValue = GetPropertyValue(credential, "IsActive") ?? GetPropertyValue(credential, "Active");
+                bool? active = null;
+                if (activeValue is bool) active = (bool)activeValue;
+                result.Add(new { guid = guid, name = name, maskedIdentifier = masked, active = active, rawNumberReturned = false });
+            }
+            return result;
+        }
+
+        private static string MaskCredentialIdentifier(string value)
+        {
+            if (String.IsNullOrWhiteSpace(value)) return null;
+            string normalized = new string(value.Where(Char.IsLetterOrDigit).ToArray());
+            if (normalized.Length == 0) return null;
+            string suffix = normalized.Substring(Math.Max(0, normalized.Length - 4));
+            return "••••" + suffix;
+        }
+
         private static object ReadGenetecStatus()
         {
             using (var engine = ConnectToGenetec())
@@ -526,7 +892,9 @@ namespace StamfordVms.GenetecReadOnlyBridge
                         visitorSyncEnabled = IsVisitorSyncEnabled() && visitorManagementLicensed,
                         visitorSyncScope = IsVisitorSyncEnabled() && visitorManagementLicensed
                             ? "native-visitor-create-update-for-invited-synthetic-booking-only" : "disabled",
-                        visitorLifecycleSyncEnabled = IsVisitorLifecycleSyncEnabled() && visitorManagementLicensed
+                        visitorLifecycleSyncEnabled = IsVisitorLifecycleSyncEnabled() && visitorManagementLicensed,
+                        cardholderFaceSyncEnabled = IsCardholderFaceSyncApproved(),
+                        cardholderFaceSyncScope = IsCardholderFaceSyncApproved() ? "read-only-approved-cardholder-image-and-masked-credential-reference" : "disabled"
                     };
                 }
                 catch (BridgeException)
