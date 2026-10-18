@@ -23,7 +23,7 @@ namespace StamfordVms.GenetecReadOnlyBridge
     internal static class Program
     {
         private const string Prefix = "http://127.0.0.1:5190/";
-        private const string BridgeBuild = "5.2.1";
+        private const string BridgeBuild = "5.2.4";
         private const string TestWriteConfirmation = "CREATE_ONLY_STAMFORD_VMS_TEST_CARDHOLDER";
         private const string VisitorSyncConfirmation = "SYNC_SYNTHETIC_STAMFORD_VMS_VISITOR";
         private const string VisitorLifecycleConfirmation = "SYNC SYNTHETIC STAMFORD VMS VISITOR LIFECYCLE";
@@ -55,6 +55,7 @@ namespace StamfordVms.GenetecReadOnlyBridge
                     Console.WriteLine("Stamford VMS Genetec bridge build " + BridgeBuild + " is listening on " + Prefix);
                     Console.WriteLine("Endpoints: GET /api/health, GET /api/genetec/status, GET /api/genetec/capabilities");
                     Console.WriteLine("Approved read-only Cardholder search: GET /api/genetec/cardholders?search=Name&limit=25 (feature and privacy gates required)");
+                    Console.WriteLine("Approved bulk student-roster metadata import: GET /api/genetec/student-roster?externalIdPrefix=STU-&limit=1000 (prefix-filtered; portrait bytes excluded)");
                     Console.WriteLine("Approved read-only Cardholder photo/credential references: GET /api/genetec/cardholder-photo?cardholderGuid=<GUID> (photo never saved by bridge)");
                     Console.WriteLine("Read-only Visitor key lookup: GET /api/genetec/visitor-booking-lookup?bookingId=VMS-SDKTEST-01");
                     Console.WriteLine("Read-only lifecycle state inspection: GET /api/genetec/visitor-lifecycle-state?bookingId=VMS-SDKTEST-01");
@@ -243,6 +244,46 @@ namespace StamfordVms.GenetecReadOnlyBridge
                     Console.Error.WriteLine("Read-only Cardholder search failed: " + ex.GetType().Name);
                     statusCode = 503;
                     payload = new { success = false, errorCode = "CARDHOLDER_SEARCH_FAILED", error = "Could not read Cardholder metadata from Genetec. Check bridge logs; no Genetec write was attempted.", checkedAtUtc = DateTime.UtcNow.ToString("o") };
+                }
+            }
+            else if (String.Equals(request.HttpMethod, "GET", StringComparison.OrdinalIgnoreCase) &&
+                String.Equals(path, "/api/genetec/student-roster-groups", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    payload = ReadGenetecStudentGroupCatalog();
+                    statusCode = 200;
+                }
+                catch (BridgeException ex)
+                {
+                    statusCode = ex.HttpStatusCode;
+                    payload = new { success = false, errorCode = ex.Code, error = ex.Message, checkedAtUtc = DateTime.UtcNow.ToString("o") };
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("Read-only Cardholder group catalog failed: " + ex.GetType().Name);
+                    statusCode = 503;
+                    payload = new { success = false, errorCode = "CARDHOLDER_GROUP_CATALOG_FAILED", error = "Could not read Cardholder group membership through this SDK. Check the local bridge log; no Genetec write was attempted.", checkedAtUtc = DateTime.UtcNow.ToString("o") };
+                }
+            }
+            else if (String.Equals(request.HttpMethod, "GET", StringComparison.OrdinalIgnoreCase) &&
+                String.Equals(path, "/api/genetec/student-roster", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    payload = ReadGenetecStudentRoster(request.QueryString["externalIdPrefix"], request.QueryString["groupNames"], request.QueryString["limit"]);
+                    statusCode = 200;
+                }
+                catch (BridgeException ex)
+                {
+                    statusCode = ex.HttpStatusCode;
+                    payload = new { success = false, errorCode = ex.Code, error = ex.Message, checkedAtUtc = DateTime.UtcNow.ToString("o") };
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("Read-only student-roster sync failed: " + ex.GetType().Name);
+                    statusCode = 503;
+                    payload = new { success = false, errorCode = "STUDENT_ROSTER_SYNC_FAILED", error = "Could not read the configured student-ID scope from Genetec. No pictures or credential values were written.", checkedAtUtc = DateTime.UtcNow.ToString("o") };
                 }
             }
             else if (String.Equals(request.HttpMethod, "GET", StringComparison.OrdinalIgnoreCase) &&
@@ -558,24 +599,18 @@ namespace StamfordVms.GenetecReadOnlyBridge
             {
                 try
                 {
-                    var query = engine.ReportManager.CreateReportQuery(ReportType.CardholderConfiguration) as EntityConfigurationQuery;
-                    if (query == null)
-                        throw new BridgeException(503, "CARDHOLDER_QUERY_UNAVAILABLE", "The SDK did not create a Cardholder configuration query.");
-                    query.EntityTypeFilter.Add(EntityType.Cardholder);
-                    var result = query.Query();
-                    if (result == null || !result.Success || result.Data == null)
-                        throw new BridgeException(503, "CARDHOLDER_QUERY_FAILED", "The Cardholder configuration query failed; no write was attempted.");
+                    // Enumerate through Engine.GetEntities rather than CardholderConfiguration reports.
+                    // Some Security Center 5.11 installations return an unsuccessful report result for this report type.
+                    // This remains a bounded, read-only query; no Cardholder or credential is modified.
+                    var cardholders = engine.GetEntities(EntityType.Cardholder).OfType<Cardholder>().Take(10001).ToList();
+                    if (cardholders.Count > 10000)
+                        throw new BridgeException(413, "CARDHOLDER_SEARCH_SCOPE_TOO_LARGE", "The directory search exceeded the 10,000-entity safety cap. Narrow the search or use an approved directory filter.");
 
                     var found = new List<object>();
                     int scanned = 0;
-                    foreach (DataRow row in result.Data.Rows)
+                    foreach (var cardholder in cardholders)
                     {
-                        if (row.ItemArray.Length == 0 || !(row[0] is Guid)) continue;
                         scanned++;
-                        if (scanned > 10000)
-                            throw new BridgeException(413, "CARDHOLDER_SEARCH_SCOPE_TOO_LARGE", "The directory search exceeded the 10,000-entity safety cap. Narrow the search or use an approved directory filter.");
-                        var cardholder = engine.GetEntity((Guid)row[0]) as Cardholder;
-                        if (cardholder == null) continue;
                         string firstName = cardholder.FirstName ?? String.Empty;
                         string lastName = cardholder.LastName ?? String.Empty;
                         string displayName = (firstName + " " + lastName).Trim();
@@ -614,11 +649,375 @@ namespace StamfordVms.GenetecReadOnlyBridge
                 catch (BridgeException) { throw; }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine("Cardholder search query failed: " + ex.GetType().Name);
-                    throw new BridgeException(503, "CARDHOLDER_SEARCH_FAILED", "The read-only Cardholder query failed. Review the local bridge log; no write was attempted.");
+                    Console.Error.WriteLine("Cardholder enumeration failed: " + ex.GetType().Name + " — " + ex.Message);
+                    throw new BridgeException(503, "CARDHOLDER_SEARCH_FAILED", "The read-only Cardholder enumeration failed. Review the local bridge log; no write was attempted.");
                 }
                 finally { try { engine.LogOff(); } catch { } }
             }
+        }
+
+        private static object ReadGenetecStudentGroupCatalog()
+        {
+            RequireCardholderFaceSyncApproval();
+            using (var engine = ConnectToGenetec())
+            {
+                try
+                {
+                    // Engine.GetEntities() is a cache enumerator, not a reliable Directory discovery query.
+                    // Query the Directory for entity GUIDs, then resolve those entities through the SDK.
+                    var cardholders = ReadConfiguredEntities<Cardholder>(engine, EntityType.Cardholder, 10000,
+                        "Cardholder", "CARDHOLDER_GROUP_SCAN_TOO_LARGE");
+                    var groups = ReadConfiguredEntities<CardholderGroup>(engine, EntityType.CardholderGroup, 5000,
+                        "Cardholder group", "CARDHOLDER_GROUP_SCAN_TOO_LARGE");
+                    if (groups.Count == 0)
+                        throw new BridgeException(503, "CARDHOLDER_GROUPS_NOT_FOUND",
+                            "The Directory EntityConfiguration query returned no CardholderGroup entities. Verify the SDK account permissions and group query result.");
+
+                    var membershipIndex = ReadCardholderGroupMembershipIndex(cardholders, groups, true);
+                    var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var group in groups)
+                    {
+                        string groupName = GetFirstStringProperty(group, new[] { "Name", "DisplayName", "GroupName", "EntityName" });
+                        if (!String.IsNullOrWhiteSpace(groupName) && !counts.ContainsKey(groupName)) counts[groupName] = 0;
+                    }
+                    int scanned = 0;
+                    foreach (var cardholder in cardholders)
+                    {
+                        scanned++;
+                        foreach (string groupName in ReadCardholderGroupNames(cardholder, engine, membershipIndex))
+                        {
+                            if (counts.ContainsKey(groupName)) counts[groupName]++;
+                        }
+                    }
+                    var groupsResult = counts.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                        .Select(kv => new { name = kv.Key, cardholderCount = kv.Value }).ToList();
+                    return new
+                    {
+                        success = true,
+                        mode = "read-only-genetec-cardholder-group-catalog",
+                        groups = groupsResult,
+                        groupCount = groupsResult.Count,
+                        scannedCardholderCount = scanned,
+                        membershipMapping = "Cardholder.IsMemberOf(CardholderGroup)",
+                        personallyIdentifyingCardholderRecordsReturned = false,
+                        portraitsReturned = false,
+                        rawCredentialNumbersReturned = false,
+                        writeAttempted = false,
+                        checkedAtUtc = DateTime.UtcNow.ToString("o")
+                    };
+                }
+                catch (BridgeException) { throw; }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("Cardholder group catalog failed: " + ex.GetType().Name + " — " + ex.Message);
+                    throw new BridgeException(503, "CARDHOLDER_GROUP_CATALOG_FAILED", "Could not enumerate Cardholders or resolve Cardholder.IsMemberOf group membership through the installed SDK. Review the local bridge log; no write was attempted.");
+                }
+                finally { try { engine.LogOff(); } catch { } }
+            }
+        }
+
+        private static List<T> ReadConfiguredEntities<T>(Engine engine, EntityType entityType, int maxRecords,
+            string displayName, string tooLargeCode) where T : class
+        {
+            var query = engine.ReportManager.CreateReportQuery(ReportType.EntityConfiguration) as EntityConfigurationQuery;
+            if (query == null)
+                throw new BridgeException(503, "ENTITY_CONFIGURATION_QUERY_UNAVAILABLE",
+                    "The SDK did not create an EntityConfigurationQuery for " + displayName + ".");
+            query.EntityTypeFilter.Add(entityType);
+            var result = query.Query();
+            if (result == null || !result.Success || result.Data == null)
+                throw new BridgeException(503, "ENTITY_CONFIGURATION_QUERY_FAILED",
+                    "The Directory EntityConfiguration query failed for " + displayName + ". Check the bridge log; no write was attempted.");
+            if (result.Data.Rows.Count > maxRecords)
+                throw new BridgeException(413, tooLargeCode,
+                    "The Directory returned more than " + maxRecords.ToString(CultureInfo.InvariantCulture) + " " + displayName + " records. Narrow the approved roster scope.");
+
+            var guids = new List<Guid>();
+            foreach (DataRow row in result.Data.Rows)
+            {
+                if (row.ItemArray.Length == 0) continue;
+                Guid guid;
+                object value = row[0];
+                if (value is Guid) guid = (Guid)value;
+                else if (value == null || !Guid.TryParse(Convert.ToString(value, CultureInfo.InvariantCulture), out guid)) continue;
+                if (guid != Guid.Empty && !guids.Contains(guid)) guids.Add(guid);
+            }
+            if (result.Data.Rows.Count > 0 && guids.Count == 0)
+                throw new BridgeException(503, "ENTITY_CONFIGURATION_RESULT_SHAPE_UNSUPPORTED",
+                    "The Directory query returned rows but no entity GUIDs in the expected first column for " + displayName + ".");
+
+            var entities = new List<T>();
+            foreach (Guid guid in guids)
+            {
+                object entity;
+                try { entity = engine.GetEntity(guid); }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("Could not load " + displayName + " entity " + guid.ToString("D") + ": " + ex.GetType().Name + " — " + ex.Message);
+                    throw new BridgeException(503, "ENTITY_CONFIGURATION_ENTITY_LOAD_FAILED",
+                        "The Directory returned a " + displayName + " GUID that the SDK could not load. Check the bridge log.");
+                }
+                T typed = entity as T;
+                if (typed == null)
+                    throw new BridgeException(503, "ENTITY_CONFIGURATION_ENTITY_TYPE_MISMATCH",
+                        "The Directory query returned an entity that could not be loaded as " + displayName + ".");
+                entities.Add(typed);
+            }
+            if (guids.Count != entities.Count)
+                throw new BridgeException(503, "ENTITY_CONFIGURATION_ENTITY_LOAD_INCOMPLETE",
+                    "Not every queried " + displayName + " could be loaded. Refusing to use a partial roster.");
+            return entities;
+        }
+
+        private static object ReadGenetecStudentRoster(string externalIdPrefix, string groupNamesText, string limitText)
+        {
+            RequireCardholderFaceSyncApproval();
+            externalIdPrefix = (externalIdPrefix ?? String.Empty).Trim();
+            if (!String.IsNullOrWhiteSpace(externalIdPrefix) && !Regex.IsMatch(externalIdPrefix, @"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$"))
+                throw new BridgeException(400, "STUDENT_ID_PREFIX_INVALID", "External ID prefix may contain only letters, digits, dot, underscore and hyphen (maximum 32 characters).");
+            var selectedGroups = ParseStudentGroupNames(groupNamesText);
+            if (selectedGroups.Count == 0 && String.IsNullOrWhiteSpace(externalIdPrefix))
+                throw new BridgeException(400, "STUDENT_SCOPE_REQUIRED", "Select one or more approved student-only Cardholder groups, or provide a verified student External ID prefix. Unfiltered Cardholder export is disabled.");
+            int limit;
+            if (!Int32.TryParse(limitText, out limit)) limit = 1000;
+            if (limit < 1 || limit > 1000)
+                throw new BridgeException(400, "STUDENT_ROSTER_LIMIT_INVALID", "Roster import limit must be between 1 and 1000.");
+
+            using (var engine = ConnectToGenetec())
+            {
+                try
+                {
+                    // Discover the full Directory roster through EntityConfiguration; GetEntities() only
+                    // enumerates entities already in the SDK cache and can omit Cardholders/groups.
+                    var cardholders = ReadConfiguredEntities<Cardholder>(engine, EntityType.Cardholder, 10000,
+                        "Cardholder", "STUDENT_ROSTER_SCOPE_TOO_LARGE");
+                    var membershipIndex = new Dictionary<Guid, List<string>>();
+                    if (selectedGroups.Count > 0)
+                    {
+                        var groups = ReadConfiguredEntities<CardholderGroup>(engine, EntityType.CardholderGroup, 5000,
+                            "Cardholder group", "STUDENT_ROSTER_SCOPE_TOO_LARGE");
+                        membershipIndex = ReadCardholderGroupMembershipIndex(cardholders, groups, true);
+                    }
+                    var found = new List<object>();
+                    int scanned = 0;
+                    int matched = 0;
+                    foreach (var cardholder in cardholders)
+                    {
+                        scanned++;
+                        string externalId = GetFirstStringProperty(cardholder, new[] { "StudentId", "ExternalId", "ExternalID", "UniqueId", "UniqueID", "PersonnelId", "EmployeeId", "EmployeeNumber" });
+                        if (!String.IsNullOrWhiteSpace(externalId)) externalId = externalId.Trim();
+                        if (!String.IsNullOrWhiteSpace(externalIdPrefix) && (String.IsNullOrWhiteSpace(externalId) || !externalId.StartsWith(externalIdPrefix, StringComparison.OrdinalIgnoreCase))) continue;
+                        var cardholderGroups = ReadCardholderGroupNames(cardholder, engine, membershipIndex);
+                        if (selectedGroups.Count > 0 && !cardholderGroups.Any(g => selectedGroups.Contains(g, StringComparer.OrdinalIgnoreCase))) continue;
+                        matched++;
+                        if (found.Count >= limit) continue;
+                        string firstName = cardholder.FirstName ?? String.Empty;
+                        string lastName = cardholder.LastName ?? String.Empty;
+                        string displayName = (firstName + " " + lastName).Trim();
+                        if (String.IsNullOrWhiteSpace(displayName)) displayName = cardholder.Name ?? String.Empty;
+                        found.Add(new
+                        {
+                            cardholderGuid = cardholder.Guid.ToString("D"),
+                            displayName = displayName,
+                            firstName = firstName,
+                            lastName = lastName,
+                            externalId = externalId,
+                            cardholderGroups = cardholderGroups,
+                            photoAvailable = HasCardholderPicture(cardholder),
+                            credentialReferences = ReadCredentialReferences(cardholder, engine)
+                        });
+                    }
+                    return new
+                    {
+                        success = true,
+                        mode = selectedGroups.Count > 0 ? "read-only-genetec-student-roster-group-import" : "read-only-genetec-student-roster-prefix-import",
+                        externalIdPrefix = externalIdPrefix,
+                        groupNames = selectedGroups,
+                        scannedCount = scanned,
+                        matchedCount = matched,
+                        returnedCount = found.Count,
+                        resultsLimited = matched > found.Count,
+                        cardholders = found,
+                        rawCredentialNumbersReturned = false,
+                        imageBytesReturned = false,
+                        writeAttempted = false,
+                        checkedAtUtc = DateTime.UtcNow.ToString("o")
+                    };
+                }
+                catch (BridgeException) { throw; }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("Student-roster entity enumeration failed: " + ex.GetType().Name + " — " + ex.Message);
+                    throw new BridgeException(503, "STUDENT_ROSTER_SYNC_FAILED", "The read-only student-roster enumeration failed. Review the local bridge log; no write was attempted.");
+                }
+                finally { try { engine.LogOff(); } catch { } }
+            }
+        }
+
+        private static List<string> ParseStudentGroupNames(string value)
+        {
+            var names = new List<string>();
+            if (String.IsNullOrWhiteSpace(value)) return names;
+            foreach (string raw in value.Split(new[] { '|' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string name = (raw ?? String.Empty).Trim();
+                if (name.Length == 0 || name.Length > 100 || name.Any(Char.IsControl) || name.Contains("|"))
+                    throw new BridgeException(400, "STUDENT_GROUP_FILTER_INVALID", "Each selected Genetec Cardholder group must be a valid name of at most 100 characters.");
+                if (!names.Contains(name, StringComparer.OrdinalIgnoreCase)) names.Add(name);
+                if (names.Count > 20)
+                    throw new BridgeException(400, "STUDENT_GROUP_FILTER_LIMIT", "Select no more than 20 approved student Cardholder groups at once.");
+            }
+            return names;
+        }
+
+        private static Dictionary<Guid, List<string>> ReadCardholderGroupMembershipIndex(
+            IList<Cardholder> cardholders, IList<CardholderGroup> groups, bool requireReliableMembership)
+        {
+            var index = new Dictionary<Guid, List<string>>();
+            if (groups == null || groups.Count == 0)
+            {
+                if (requireReliableMembership)
+                    throw new BridgeException(503, "CARDHOLDER_GROUPS_NOT_FOUND",
+                        "No CardholderGroup entities were returned by the Directory query. Refusing group-scoped import.");
+                return index;
+            }
+
+            // Security Center exposes membership as Cardholder.IsMemberOf(CardholderGroup), including
+            // membership inherited through nested groups. It is a method, not a public collection property.
+            // Use reflection so the bridge still compiles against SDK builds that do not expose that method.
+            MethodInfo isMemberOf = typeof(Cardholder).GetMethods(BindingFlags.Instance | BindingFlags.Public)
+                .FirstOrDefault(method =>
+                {
+                    if (!String.Equals(method.Name, "IsMemberOf", StringComparison.Ordinal) || method.ReturnType != typeof(bool)) return false;
+                    var parameters = method.GetParameters();
+                    return parameters.Length == 1 && parameters[0].ParameterType == typeof(CardholderGroup);
+                });
+
+            if (isMemberOf != null)
+            {
+                foreach (var cardholder in cardholders)
+                {
+                    foreach (var group in groups)
+                    {
+                        bool member;
+                        try
+                        {
+                            object result = isMemberOf.Invoke(cardholder, new object[] { group });
+                            if (!(result is bool))
+                                throw new InvalidOperationException("Cardholder.IsMemberOf returned a non-Boolean result.");
+                            member = (bool)result;
+                        }
+                        catch (Exception ex)
+                        {
+                            Exception detail = ex is TargetInvocationException && ex.InnerException != null ? ex.InnerException : ex;
+                            Console.Error.WriteLine("Cardholder.IsMemberOf failed for group " + group.Guid.ToString("D") +
+                                ", cardholder " + cardholder.Guid.ToString("D") + ": " + detail.GetType().Name + " — " + detail.Message);
+                            throw new BridgeException(503, "CARDHOLDER_GROUP_MEMBERSHIP_CHECK_FAILED",
+                                "The SDK exposed Cardholder.IsMemberOf but failed while evaluating a membership. Refusing a partial group catalog; inspect the local bridge log.");
+                        }
+                        if (!member) continue;
+                        string groupName = GetFirstStringProperty(group, new[] { "Name", "DisplayName", "GroupName", "EntityName" });
+                        if (String.IsNullOrWhiteSpace(groupName)) continue;
+                        if (!index.ContainsKey(cardholder.Guid)) index[cardholder.Guid] = new List<string>();
+                        if (!index[cardholder.Guid].Contains(groupName, StringComparer.OrdinalIgnoreCase)) index[cardholder.Guid].Add(groupName);
+                    }
+                }
+                if (requireReliableMembership && cardholders.Count > 0 && index.Count == 0)
+                    throw new BridgeException(503, "CARDHOLDER_GROUP_MEMBERSHIP_EMPTY",
+                        "The SDK membership API ran successfully but found no Cardholder-to-group relationships. Confirm that the Directory query includes the expected student groups and Cardholders.");
+                Console.WriteLine("Cardholder group membership resolved with Cardholder.IsMemberOf(CardholderGroup); cardholders=" +
+                    cardholders.Count.ToString(CultureInfo.InvariantCulture) + ", groups=" + groups.Count.ToString(CultureInfo.InvariantCulture) +
+                    ", linkedCardholders=" + index.Count.ToString(CultureInfo.InvariantCulture));
+                return index;
+            }
+
+            // Older SDK fallback: inspect known member collections on queried group entities.
+            foreach (object group in groups)
+            {
+                string groupName = GetFirstStringProperty(group, new[] { "Name", "DisplayName", "GroupName", "EntityName" });
+                if (String.IsNullOrWhiteSpace(groupName)) continue;
+                foreach (string propertyName in new[] { "Cardholders", "Members", "MemberCardholders", "CardholderMembers", "CardholderIds", "MemberIds", "Entities" })
+                {
+                    object rawMembers = GetPropertyValue(group, propertyName);
+                    var members = rawMembers as System.Collections.IEnumerable;
+                    if (members == null || rawMembers is string) continue;
+                    foreach (object member in members)
+                    {
+                        Guid memberGuid;
+                        if (!TryReadEntityGuid(member, out memberGuid)) continue;
+                        if (!index.ContainsKey(memberGuid)) index[memberGuid] = new List<string>();
+                        if (!index[memberGuid].Contains(groupName, StringComparer.OrdinalIgnoreCase)) index[memberGuid].Add(groupName);
+                    }
+                }
+            }
+            if (index.Count == 0 && requireReliableMembership)
+            {
+                Console.Error.WriteLine("Group membership mapping unavailable. Cardholder SDK members: " +
+                    String.Join(", ", typeof(Cardholder).GetMethods(BindingFlags.Instance | BindingFlags.Public).Select(m => m.Name).Distinct().OrderBy(n => n, StringComparer.OrdinalIgnoreCase)));
+                throw new BridgeException(503, "CARDHOLDER_GROUP_MEMBERSHIP_API_UNAVAILABLE",
+                    "This installed Genetec SDK exposes neither Cardholder.IsMemberOf(CardholderGroup) nor readable group member collections. Do not run an unfiltered import. Check bridge log and SDK compatibility.");
+            }
+            return index;
+        }
+
+        private static bool TryReadEntityGuid(object value, out Guid guid)
+        {
+            guid = Guid.Empty;
+            if (value == null) return false;
+            if (value is Guid) { guid = (Guid)value; return true; }
+            if (value is string && Guid.TryParse((string)value, out guid)) return true;
+            foreach (string propertyName in new[] { "Guid", "EntityGuid", "CardholderGuid", "Id", "EntityId" })
+            {
+                object raw = GetPropertyValue(value, propertyName);
+                if (raw is Guid) { guid = (Guid)raw; return true; }
+                if (raw != null && Guid.TryParse(Convert.ToString(raw, CultureInfo.InvariantCulture), out guid)) return true;
+            }
+            return false;
+        }
+
+        private static List<string> ReadCardholderGroupNames(Cardholder cardholder, Engine engine, IDictionary<Guid, List<string>> membershipIndex)
+        {
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string propertyName in new[] { "CardholderGroups", "CardholderGroupMemberships", "GroupMemberships", "CardholderGroupIds", "Groups", "GroupIds" })
+            {
+                AddCardholderGroupNames(GetPropertyValue(cardholder, propertyName), engine, names, 0);
+            }
+            if (membershipIndex != null && membershipIndex.TryGetValue(cardholder.Guid, out var indexed))
+                foreach (string name in indexed) if (!String.IsNullOrWhiteSpace(name)) names.Add(name.Trim());
+            return names.Where(n => !String.IsNullOrWhiteSpace(n)).OrderBy(n => n, StringComparer.OrdinalIgnoreCase).Take(30).ToList();
+        }
+
+        private static void AddCardholderGroupNames(object value, Engine engine, HashSet<string> names, int depth)
+        {
+            if (value == null || depth > 3) return;
+            if (value is Guid || (value is string && Guid.TryParse((string)value, out _)))
+            {
+                Guid id;
+                if (TryReadEntityGuid(value, out id))
+                {
+                    object entity = null;
+                    try { entity = engine.GetEntity(id); } catch { }
+                    string entityName = GetFirstStringProperty(entity, new[] { "Name", "DisplayName", "GroupName", "EntityName" });
+                    if (!String.IsNullOrWhiteSpace(entityName)) names.Add(entityName.Trim());
+                }
+                return;
+            }
+            if (value is string)
+            {
+                string text = ((string)value).Trim();
+                if (text.Length > 0 && text.Length <= 100 && !text.Any(Char.IsControl)) names.Add(text);
+                return;
+            }
+            var enumerable = value as System.Collections.IEnumerable;
+            if (enumerable != null && !(value is byte[]))
+            {
+                foreach (object item in enumerable) AddCardholderGroupNames(item, engine, names, depth + 1);
+                return;
+            }
+            string name = GetFirstStringProperty(value, new[] { "Name", "DisplayName", "GroupName", "CardholderGroupName", "EntityName" });
+            if (!String.IsNullOrWhiteSpace(name)) { names.Add(name.Trim()); return; }
+            object nested = GetPropertyValue(value, "Guid") ?? GetPropertyValue(value, "EntityGuid") ?? GetPropertyValue(value, "Id");
+            if (nested != null) AddCardholderGroupNames(nested, engine, names, depth + 1);
         }
 
         private static object ReadGenetecCardholderPhoto(string cardholderGuidText)
@@ -659,6 +1058,7 @@ namespace StamfordVms.GenetecReadOnlyBridge
                             firstName = firstName,
                             lastName = lastName,
                             externalId = GetFirstStringProperty(cardholder, new[] { "StudentId", "ExternalId", "ExternalID", "UniqueId", "UniqueID", "PersonnelId", "EmployeeId" }),
+                            cardholderGroups = ReadCardholderGroupNames(cardholder, engine, null),
                             credentialReferences = ReadCredentialReferences(cardholder, engine)
                         },
                         imageMimeType = mime,

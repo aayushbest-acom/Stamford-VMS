@@ -115,3 +115,6 @@ Checkout read-back is treated as eventually consistent: after `Visitor.Checkout(
 ## Archived checkout ledger reconciliation
 
 `GET /api/genetec/visitor-lifecycle-state` is read-only. If it confirms an archived `CheckedOut` visit while the saved check-out event ID is empty, use `Reconcile-NativeVisitorCheckout.ps1 -BookingId VMS-SDKTEST-06`. It prompts for an exact phrase and updates only the local event ledger after repeating the active/archive and check-in-ledger checks. It does not write to Genetec. Never use it unless the archive state is independently confirmed.
+### Scoped student roster metadata import
+
+`GET /api/genetec/student-roster?externalIdPrefix=STU-&limit=1000` is an approval-gated, read-only query. It returns only Cardholders whose supported Student/External ID field begins with the supplied prefix, enforces a 10,000-entity scan cap and a 1,000-result cap, returns masked credential references, and never returns portrait bytes. Do not use a prefix that also includes staff or visitors. It does not perform face identification or write attendance to Genetec.

@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 $baseUrl = 'http://127.0.0.1:5190'
-$expectedBridgeBuild = '5.1.6'
+$expectedBridgeBuild = '5.2.4'
 $bridgeDir = $PSScriptRoot
 $startScript = Join-Path $bridgeDir 'Start-Bridge.ps1'
 $exe = Join-Path $bridgeDir 'bin\Debug\GenetecReadOnlyBridge.exe'

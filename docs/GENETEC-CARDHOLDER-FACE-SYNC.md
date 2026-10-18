@@ -50,3 +50,8 @@ The bridge may inspect credential-number properties through reflection because S
 - Group-photo identity matching is excluded unless Stamford approves a separate scope change. Even if enabled, only a supplied roster of individually enrolled people is compared; group photos are not used to enrol faces and raw group images are not persisted.
 - Validate the exact picture representation and assigned credential API on the installed Security Center 5.11 SDK. The bridge uses bounded reflective property/method discovery because SDK object shapes can differ. No live SDK build has been claimed by static tests alone.
 - Acceptance must include read-only Cardholder query, correct GUID/photo association, masked-only credential output, DPAPI at-rest test, duplicate GUID mapping rejection, consent/approval gates, human-confirmation enforcement, withdrawal/deletion and audit review.
+
+
+## Bulk roster selection by Cardholder group
+
+Build 5.2.3+ can load the read-only Genetec Cardholder group catalog and import only explicitly selected groups. Select only approved student-only groups, such as the school's configured divisions; leave Parent and Staff groups unselected. A verified External ID prefix is optional as an additional restriction. The bridge refuses an import without either an explicit group selection or a valid prefix; it never performs an unfiltered person export. Cardholder group mapping is reflected from the installed SDK and must be verified on the target Security Center 5.11 host before using the imported roster.

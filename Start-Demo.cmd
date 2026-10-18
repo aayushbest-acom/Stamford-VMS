@@ -1,13 +1,14 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-echo Starting Stamford VMS prototype - BUILD 5.2.1
+echo Starting Stamford VMS prototype - BUILD 5.2.4
 echo UI updates: explicit visit start/end times, laptop-camera QR scanner, no Day 1/Day 2 banner.
 echo URL: http://127.0.0.1:8080
 echo Persistence: local SQLite service with browser fallback.
 echo QR scanner: browser native detection or local OpenCV frame decoder.
 echo SAFETY: prototype only; synthetic data only; application authentication is not configured.
-echo Face attendance: disabled by default; requires school policy flags and individual consent.
+echo Kiosk face attendance: mock by default; live recognition requires written school approval, person-specific consent, approved Genetec linkage and an on-host UAT.
+echo Kiosk attendance records are local only; this flow does not write attendance events to Genetec.
 echo Genetec Cardholder image import: disabled by default; use only with written approval and consent records.
 echo Launch folder: %CD%
 echo.
@@ -36,7 +37,7 @@ goto LAUNCH_END
 
 :PORT_IN_USE
 echo ERROR: Port 8080 is already in use. A previous VMS instance is likely still running.
-echo Close the old VMS console, then launch Start-Demo.cmd from this Milestone 5.2.1 folder.
+echo Close the old VMS console, then launch Start-Demo.cmd from this Milestone 5.2.4 folder.
 echo The launcher stopped here so the older UI cannot silently appear to be the updated build.
 timeout /t 15 /nobreak >nul
 exit /b 2

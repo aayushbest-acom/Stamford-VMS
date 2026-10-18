@@ -36,6 +36,11 @@ try:
 except ImportError:  # direct script execution
     from face_attendance import FaceAttendanceError, FaceAttendanceStore
 
+try:
+    from .integrations import IntegrationError, IntegrationHub
+except ImportError:  # direct script execution
+    from integrations import IntegrationError, IntegrationHub
+
 MAX_BODY_BYTES = 4 * 1024 * 1024
 SCHEMA_VERSION = 1
 STATE_LIMITS = {
@@ -145,13 +150,14 @@ def validate_snapshot(payload: object) -> tuple[int, dict]:
     return revision, normalized
 
 
-def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | None = None, face_store: FaceAttendanceStore | None = None):
+def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | None = None, face_store: FaceAttendanceStore | None = None, integration_hub: IntegrationHub | None = None):
     ui_dir = ui_dir.resolve()
     domain_store = domain_store or DomainStore(store.db_path)
     face_store = face_store or FaceAttendanceStore(store.db_path.with_name("face-attendance.sqlite3"))
+    integration_hub = integration_hub or IntegrationHub(store.db_path)
 
     class Handler(SimpleHTTPRequestHandler):
-        server_version = "StamfordVMSPrototype/5.2.1"
+        server_version = "StamfordVMSPrototype/5.2.4"
         sys_version = ""
 
         def __init__(self, *args, **kwargs):
@@ -236,7 +242,21 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
                 return
             path = urlsplit(self.path).path
             if path == "/api/v1/health":
-                self._send_json(200, {"ok": True, "service": "Stamford VMS local prototype service", "build": "5.2.1", "schoolTimeZone": "Asia/Singapore", "mode": "prototype-only", "persistence": "sqlite-local", "authentication": "not-configured", "boundToLoopback": True})
+                self._send_json(200, {"ok": True, "service": "Stamford VMS local prototype service", "build": "5.2.4", "schoolTimeZone": "Asia/Singapore", "mode": "prototype-only", "persistence": "sqlite-local", "authentication": "not-configured", "boundToLoopback": True})
+                return
+            if path == "/api/v1/integrations/status":
+                try:
+                    self._send_json(200, integration_hub.status())
+                except Exception:
+                    logging.exception("Unable to read adapter status")
+                    self._send_json(500, {"ok": False, "error": "INTEGRATION_STATUS_FAILED", "message": "Integration status could not be read."})
+                return
+            if path == "/api/v1/integrations/sms/outbox":
+                try:
+                    self._send_json(200, {"ok": True, "messages": integration_hub.list_outbox()})
+                except Exception:
+                    logging.exception("Unable to read SMS outbox")
+                    self._send_json(500, {"ok": False, "error": "SMS_OUTBOX_FAILED", "message": "The local SMS outbox could not be read."})
                 return
             if path == "/api/v1/state":
                 try:
@@ -271,6 +291,24 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
                     logging.exception("Unable to inspect face-attendance feature status")
                     self._send_json(500, {"ok": False, "error": "FACE_STATUS_FAILED", "message": "Face-attendance status could not be read."})
                 return
+            if path == "/api/v1/kiosk-face/status":
+                try:
+                    self._send_json(200, face_store.kiosk_status())
+                except Exception:
+                    logging.exception("Unable to inspect kiosk face adapter status")
+                    self._send_json(500, {"ok": False, "error": "KIOSK_FACE_STATUS_FAILED", "message": "Kiosk face status could not be read."})
+                return
+            if path == "/api/v1/kiosk-face/events":
+                try:
+                    query = parse_qs(urlsplit(self.path).query)
+                    session_id = (query.get("sessionId") or [""])[0]
+                    self._send_json(200, face_store.list_kiosk_events(session_id))
+                except FaceAttendanceError as exc:
+                    self._send_face_error(exc)
+                except Exception:
+                    logging.exception("Unable to list kiosk attendance events")
+                    self._send_json(500, {"ok": False, "error": "KIOSK_FACE_EVENTS_FAILED", "message": "Kiosk attendance events could not be loaded."})
+                return
             if path == "/api/v1/face-attendance/students":
                 try:
                     self._send_json(200, face_store.list_students())
@@ -279,6 +317,47 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
                 except Exception:
                     logging.exception("Unable to list consented face enrollments")
                     self._send_json(500, {"ok": False, "error": "FACE_STUDENT_LIST_FAILED", "message": "The enrolled-student list could not be loaded."})
+                return
+            if path == "/api/v1/genetec/student-roster/groups":
+                try:
+                    self._send_json(200, face_store.list_genetec_student_groups())
+                except FaceAttendanceError as exc:
+                    self._send_face_error(exc)
+                except Exception:
+                    logging.exception("Unable to load Genetec Cardholder groups")
+                    self._send_json(500, {"ok": False, "error": "GENETEC_GROUPS_FAILED", "message": "Genetec Cardholder groups could not be loaded."})
+                return
+            if path == "/api/v1/genetec/student-roster":
+                try:
+                    query = parse_qs(urlsplit(self.path).query)
+                    search = (query.get("search") or [""])[0]
+                    self._send_json(200, face_store.list_genetec_student_roster(search))
+                except FaceAttendanceError as exc:
+                    self._send_face_error(exc)
+                except Exception:
+                    logging.exception("Unable to list imported Genetec student roster")
+                    self._send_json(500, {"ok": False, "error": "GENETEC_ROSTER_LIST_FAILED", "message": "The imported student roster could not be loaded."})
+                return
+            if path == "/api/v1/genetec/student-roster/attendance":
+                try:
+                    query = parse_qs(urlsplit(self.path).query)
+                    session_id = (query.get("sessionId") or [""])[0]
+                    self._send_json(200, face_store.list_genetec_roster_attendance(session_id))
+                except FaceAttendanceError as exc:
+                    self._send_face_error(exc)
+                except Exception:
+                    logging.exception("Unable to list Genetec roster attendance")
+                    self._send_json(500, {"ok": False, "error": "GENETEC_ROSTER_ATTENDANCE_LIST_FAILED", "message": "The roster attendance events could not be loaded."})
+                return
+            portrait_match = re.fullmatch(r"/api/v1/genetec/student-roster/([0-9a-fA-F-]{36})/portrait", path)
+            if portrait_match:
+                try:
+                    self._send_json(200, face_store.get_genetec_roster_portrait(portrait_match.group(1)))
+                except FaceAttendanceError as exc:
+                    self._send_face_error(exc)
+                except Exception:
+                    logging.exception("Unable to load Genetec portrait for staff review")
+                    self._send_json(500, {"ok": False, "error": "GENETEC_ROSTER_PORTRAIT_FAILED", "message": "The selected portrait could not be loaded."})
                 return
             if path == "/api/v1/face-attendance/genetec-cardholders":
                 try:
@@ -352,6 +431,10 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
                 return
 
             try:
+                if path == "/api/v1/integrations/sms/send":
+                    result = integration_hub.send_sms(payload)
+                    self._send_json(200 if result.get("alreadyApplied") else 201, result)
+                    return
                 if path == "/api/v1/visits":
                     result = domain_store.create_visit(payload)
                     self._send_json(201, result)
@@ -393,6 +476,13 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
                     event_id = payload.get("eventId") if isinstance(payload, dict) else None
                     self._send_json(200, domain_store.transition_by_qr(token, action, event_id))
                     return
+                if path == "/api/v1/genetec/student-roster/import":
+                    self._send_json(200, face_store.import_genetec_student_roster(payload))
+                    return
+                attendance_match = re.fullmatch(r"/api/v1/genetec/student-roster/([0-9a-fA-F-]{36})/attendance", path)
+                if attendance_match:
+                    self._send_json(201, face_store.record_genetec_roster_attendance(attendance_match.group(1), payload))
+                    return
                 if path == "/api/v1/face-attendance/enroll":
                     self._send_json(201, face_store.enroll(payload))
                     return
@@ -409,6 +499,12 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
                 if path == "/api/v1/face-attendance/confirm":
                     self._send_json(200, face_store.confirm_student(payload))
                     return
+                if path == "/api/v1/kiosk-face/match":
+                    self._send_json(200, face_store.match_kiosk_face(payload))
+                    return
+                if path == "/api/v1/kiosk-face/confirm":
+                    self._send_json(201, face_store.confirm_kiosk_face(payload))
+                    return
                 if path == "/api/v1/face-attendance/group-match":
                     self._send_json(200, face_store.match_group(payload))
                     return
@@ -420,6 +516,10 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
                 self._send_domain_error(exc)
             except FaceAttendanceError as exc:
                 self._send_face_error(exc)
+            except IntegrationError as exc:
+                payload = {"ok": False, "error": exc.code, "message": exc.message}
+                payload.update(exc.extra)
+                self._send_json(exc.status, payload)
             except Exception:
                 # Never log request bodies; they can contain raw QR tokens.
                 logging.exception("Domain API request failed for route %s", path[:100])
@@ -458,7 +558,9 @@ def main(argv=None) -> int:
         logging.info("Serving Stamford VMS prototype at http://%s:%s", args.host, args.port)
         logging.info("Local SQLite database: %s", args.data_dir / "prototype-state.sqlite3")
         logging.info("Domain API routes: POST /api/v1/visits, POST /api/v1/qr/decode-frame, POST /api/v1/qr/validate, POST /api/v1/qr/check-in, POST /api/v1/qr/check-out, POST /api/v1/qr/svg")
+        logging.info("Prototype adapters: GET /api/v1/integrations/status; GET /api/v1/integrations/sms/outbox; POST /api/v1/integrations/sms/send (mock by default; live provider is allow-list gated)")
         logging.info("Optional gated face attendance API: GET /api/v1/face-attendance/status; POST /api/v1/face-attendance/enroll|match|confirm|group-match|group-confirm-batch")
+        logging.info("Approved local Genetec student roster API: GET /api/v1/genetec/student-roster/groups; POST /api/v1/genetec/student-roster/import; GET /api/v1/genetec/student-roster; GET /api/v1/genetec/student-roster/{guid}/portrait; POST /api/v1/genetec/student-roster/{guid}/attendance")
         logging.warning("PROTOTYPE ONLY: no enterprise authentication/authorization; use synthetic data only; do not expose beyond loopback")
         logging.info("Press Ctrl+C to stop")
         try:

@@ -1,7 +1,7 @@
 # Stamford VMS Prototype Repository
 
 **Project:** ACOM × Stamford American International School — Visitor Management System
-**Current milestone:** 5.1.6 — sequence pending historical check-in verification before checkout sync
+**Current milestone:** 5.2.4 — kiosk Student/Staff/Contractor attendance flow with explicit mock/live boundaries
 **Repository status:** Prototype source, synthetic data, and a loopback-only .NET Framework bridge. Not a production release.
 
 ## What is in this repository
@@ -138,3 +138,20 @@ The local loopback bridge now supports gated, read-only Cardholder search and re
 The additional flag `STAMFORD_GENETEC_CARDHOLDER_FACE_SYNC_APPROVED=1` is required in both the Python service and Genetec bridge processes, alongside the existing student face-attendance and biometric policy gates. All three remain off by default. Raw card numbers are masked by the bridge and rejected by the service if they are not masked. The selected Genetec portrait and camera captures are processed in memory; only encrypted face crops are retained using Windows DPAPI CurrentUser. A staff member must confirm every match before attendance is written to the local ledger.
 
 See `docs/GENETEC-CARDHOLDER-FACE-SYNC.md`. This remains a gated prototype, not a production biometric attendance product. The precise Cardholder picture property and credential mapping must be verified against the installed Security Center 5.11 SDK on the target Windows host.
+## Build 5.2.2 — Scoped Genetec student roster and staff-confirmed attendance
+
+This incremental build adds an approval-gated, read-only bulk import of Genetec Cardholder metadata scoped by an explicit Student External ID prefix. The local roster stores Cardholder GUIDs, identifiers, names, portrait availability and masked credential references; it does not bulk-store portraits or raw credential values. A portrait is fetched in memory on demand for staff visual review. Attendance is recorded in the local VMS ledger only after staff confirm the selected record and person, and checkout requires a prior check-in in the same session.
+
+The feature does not identify a person from an arbitrary image or write attendance to Genetec. Use an External ID prefix reserved for the approved student population; unfiltered exports are blocked. Because application authentication/RBAC is not yet implemented, use synthetic data only. See `docs/GENETEC-STUDENT-ROSTER-AND-ATTENDANCE.md`.
+
+
+## Build 5.2.3 — dual-mode prototype integrations
+
+The Integrations & devices page adds a persistent local mock SMS outbox, allow-list-gated live Vonage/Twilio SMS provider adapters, a Windows browser print-dialog check, and live browser webcam preview/frame capture. Mock sends are clearly marked `Simulated`; live provider acceptance is not represented as confirmed handset delivery. Live invitation SMS is blocked until an approved HTTPS visitor-pass page exists and `STAMFORD_PUBLIC_PASS_URL_TEMPLATE` points to it. The template setting alone does not deploy that endpoint. The UI build-title mismatch was corrected in build 5.2.3.
+
+See [`docs/INTEGRATIONS-SETUP.md`](docs/INTEGRATIONS-SETUP.md) for setup, trial limitations, safe environment configuration and current acceptance boundaries. The webcam preview does not claim to implement or validate the SRS AI detectors. Windows printer output and the Genetec bridge still require target-host validation.
+
+
+## Build 5.2.4 — kiosk face-attendance workflow
+
+The self-service kiosk now offers Student, Staff and Contractor attendance choices, a live browser-webcam capture, an explicit mock/live mode indicator, a returned candidate profile (name, record ID, affiliation and safe Genetec-linked metadata where present), a confirmation step, and a local attendance-session ledger. Mock mode returns scripted synthetic identities and is clearly labelled; it does not perform facial recognition or write to Genetec. Live mode is strictly gated and searches only active, individually approved profiles already linked to a Genetec Cardholder portrait and additional local enrollment samples. It does not yet enumerate and facial-search every raw Genetec Cardholder portrait. The experimental LBPH matcher is not a validated production-grade face identification model. See `docs/KIOSK-FACE-ATTENDANCE.md` and `docs/CHANGE-REQUEST-KIOSK-FACE-ATTENDANCE.md`; the new self-service identification purpose requires signed school safeguarding/privacy approval and a requirements change before real student data is used.

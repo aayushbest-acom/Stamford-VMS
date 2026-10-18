@@ -40,6 +40,7 @@ DEFAULT_LBPH_MAX_DISTANCE = 55.0
 STUDENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$")
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{1,95}$")
 REFERENCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,119}$")
+PERSON_TYPES = {"Student", "Staff", "Contractor"}
 GENETEC_BRIDGE_DEFAULT = "http://127.0.0.1:5190"
 GENETEC_CREDENTIAL_REF_MAX = 20
 DATA_URL_RE = re.compile(r"^data:image/(?:jpeg|jpg|png|webp);base64,([A-Za-z0-9+/=\r\n]+)$", re.I)
@@ -119,6 +120,30 @@ def _genetec_bridge_get(path: str, query: dict | None = None) -> dict:
         code = parsed_json.get("errorCode") or "GENETEC_RESPONSE_NOT_VERIFIED"
         raise FaceAttendanceError(503, str(code)[:80], str(message)[:300])
     return parsed_json
+
+
+def _safe_genetec_profile_metadata(raw: object) -> dict:
+    """Allow-list low-risk identity metadata returned by the read-only bridge."""
+    if not isinstance(raw, dict):
+        return {}
+    safe: dict[str, object] = {}
+    for key in ("firstName", "lastName", "externalId", "cardholderStatus"):
+        value = raw.get(key)
+        if isinstance(value, str):
+            value = "".join(ch for ch in value.strip() if ch >= " " and ch != "\x7f")[:160]
+            if value:
+                safe[key] = value
+    groups = raw.get("cardholderGroups")
+    if isinstance(groups, list):
+        clean_groups = []
+        for value in groups[:30]:
+            if isinstance(value, str):
+                value = "".join(ch for ch in value.strip() if ch >= " " and ch != "\x7f")[:100]
+                if value and value not in clean_groups:
+                    clean_groups.append(value)
+        if clean_groups:
+            safe["cardholderGroups"] = clean_groups
+    return safe
 
 
 def _safe_genetec_credential_refs(raw: object) -> list[dict]:
@@ -203,6 +228,22 @@ def _validate_session(value: object) -> str:
     if not isinstance(value, str) or not SESSION_ID_RE.fullmatch(value.strip()):
         raise FaceAttendanceError(400, "INVALID_SESSION_ID", "sessionId must be a stable 2–96 character event/session reference.")
     return value.strip()
+
+
+def _person_type(value: object) -> str:
+    """Normalize one of the person categories explicitly supported by the kiosk."""
+    if not isinstance(value, str):
+        raise FaceAttendanceError(400, "PERSON_TYPE_REQUIRED", "Choose Student, Staff or Contractor.")
+    canonical = next((item for item in PERSON_TYPES if item.casefold() == value.strip().casefold()), None)
+    if canonical is None:
+        raise FaceAttendanceError(400, "INVALID_PERSON_TYPE", "personType must be Student, Staff or Contractor.")
+    return canonical
+
+
+def _kiosk_mode() -> str:
+    """Mock is the safe default; live recognition must be explicitly selected."""
+    value = os.environ.get("STAMFORD_KIOSK_FACE_MODE", "mock").strip().lower()
+    return value if value in {"mock", "live"} else "mock"
 
 
 def _dpapi_protect(raw: bytes, description: str) -> bytes:
@@ -358,13 +399,15 @@ class FaceAttendanceStore:
                     student_id TEXT PRIMARY KEY,
                     display_name TEXT NOT NULL,
                     class_name TEXT NOT NULL,
+                    person_type TEXT NOT NULL DEFAULT 'Student',
                     consent_reference TEXT NOT NULL,
                     school_approval_reference TEXT NOT NULL,
                     approved_by TEXT NOT NULL,
                     enrolled_at_utc TEXT NOT NULL,
                     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
                     genetec_cardholder_guid TEXT,
-                    genetec_credential_refs_json TEXT NOT NULL DEFAULT '[]'
+                    genetec_credential_refs_json TEXT NOT NULL DEFAULT '[]',
+                    genetec_metadata_json TEXT NOT NULL DEFAULT '{}'
                 );
                 CREATE TABLE IF NOT EXISTS face_samples (
                     student_id TEXT NOT NULL REFERENCES face_enrollments(student_id),
@@ -408,14 +451,68 @@ class FaceAttendanceStore:
                     outcome TEXT NOT NULL,
                     detail_json TEXT NOT NULL DEFAULT '{}'
                 );
+                CREATE TABLE IF NOT EXISTS genetec_cardholder_roster (
+                    cardholder_guid TEXT PRIMARY KEY,
+                    external_id TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    first_name TEXT NOT NULL DEFAULT '',
+                    last_name TEXT NOT NULL DEFAULT '',
+                    photo_available INTEGER NOT NULL DEFAULT 0 CHECK(photo_available IN (0,1)),
+                    credential_refs_json TEXT NOT NULL DEFAULT '[]',
+                    roster_prefix TEXT NOT NULL,
+                    cardholder_groups_json TEXT NOT NULL DEFAULT '[]',
+                    imported_at_utc TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS genetec_cardholder_attendance_events (
+                    attendance_id TEXT PRIMARY KEY,
+                    cardholder_guid TEXT NOT NULL REFERENCES genetec_cardholder_roster(cardholder_guid),
+                    external_id TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL CHECK(event_type IN ('CheckIn','CheckOut')),
+                    occurred_at_utc TEXT NOT NULL,
+                    operator_name TEXT NOT NULL,
+                    verification_method TEXT NOT NULL CHECK(verification_method='staff-confirmed-genetec-portrait-review'),
+                    credential_refs_json TEXT NOT NULL DEFAULT '[]',
+                    UNIQUE(cardholder_guid,session_id,event_type)
+                );
+                CREATE TABLE IF NOT EXISTS kiosk_face_mock_tickets (
+                    ticket_id TEXT PRIMARY KEY,
+                    person_type TEXT NOT NULL CHECK(person_type IN ('Student','Staff','Contractor')),
+                    person_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL CHECK(event_type IN ('CheckIn','CheckOut')),
+                    created_at_utc TEXT NOT NULL,
+                    expires_at_utc TEXT NOT NULL,
+                    consumed_at_utc TEXT
+                );
+                CREATE TABLE IF NOT EXISTS kiosk_face_mock_attendance_events (
+                    attendance_id TEXT PRIMARY KEY,
+                    person_type TEXT NOT NULL CHECK(person_type IN ('Student','Staff','Contractor')),
+                    person_id TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    affiliation TEXT NOT NULL,
+                    cardholder_guid TEXT NOT NULL,
+                    credential_refs_json TEXT NOT NULL DEFAULT '[]',
+                    session_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL CHECK(event_type IN ('CheckIn','CheckOut')),
+                    occurred_at_utc TEXT NOT NULL,
+                    confirmation_method TEXT NOT NULL CHECK(confirmation_method='demo-self-confirmed'),
+                    ticket_id TEXT NOT NULL UNIQUE REFERENCES kiosk_face_mock_tickets(ticket_id),
+                    UNIQUE(person_type,person_id,session_id,event_type)
+                );
                 CREATE INDEX IF NOT EXISTS idx_face_samples_student ON face_samples(student_id);
                 CREATE INDEX IF NOT EXISTS idx_attendance_session ON student_attendance_events(session_id,group_event_id);
                 CREATE INDEX IF NOT EXISTS idx_face_tickets_expiry ON face_match_tickets(expires_at_utc);
             """)
             # Backward-compatible additive migrations for existing Milestone 5.2 biometric databases.
             for table, column, definition in (
+                ("face_enrollments", "person_type", "TEXT NOT NULL DEFAULT 'Student'"),
+                ("genetec_cardholder_roster", "cardholder_groups_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("face_enrollments", "genetec_cardholder_guid", "TEXT"),
                 ("face_enrollments", "genetec_credential_refs_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("face_enrollments", "genetec_metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
                 ("student_attendance_events", "genetec_cardholder_guid", "TEXT"),
                 ("student_attendance_events", "genetec_credential_refs_json", "TEXT NOT NULL DEFAULT '[]'"),
             ):
@@ -434,6 +531,8 @@ class FaceAttendanceStore:
         cv2, _ = _opencv_module()
         with closing(self._connect()) as conn:
             active_students = conn.execute("SELECT COUNT(*) AS n FROM face_enrollments WHERE active=1").fetchone()["n"]
+            imported_cardholders = conn.execute("SELECT COUNT(*) AS n FROM genetec_cardholder_roster").fetchone()["n"]
+            by_type = {row["person_type"]: int(row["n"]) for row in conn.execute("SELECT person_type,COUNT(*) AS n FROM face_enrollments WHERE active=1 GROUP BY person_type").fetchall()}
         return {
             "ok": True,
             "studentFaceAttendanceEnabled": _student_feature_gate(),
@@ -446,9 +545,37 @@ class FaceAttendanceStore:
             "engineAvailable": cv2 is not None,
             "encryptedStorageAvailable": os.name == "nt",
             "activeEnrolledStudents": int(active_students),
+            "activeEnrolledByPersonType": {key: by_type.get(key, 0) for key in sorted(PERSON_TYPES)},
+            "importedGenetecRosterCount": int(imported_cardholders),
+            "genetecRosterAttendanceIsStaffConfirmed": True,
             "rawImagesPersisted": False,
             "groupImagesPersisted": False,
             "recognitionResultRequiresHumanConfirmation": True,
+            "authentication": "not-configured-prototype-only",
+        }
+
+    def kiosk_status(self) -> dict:
+        """Status for the kiosk's dual-mode face-attendance workflow."""
+        base = self.status()
+        mode = _kiosk_mode()
+        live_ready = bool(
+            mode == "live"
+            and _genetec_cardholder_face_sync_gate()
+            and base["engineAvailable"]
+            and base["encryptedStorageAvailable"]
+        )
+        return {
+            "ok": True,
+            "mode": mode,
+            "displayMode": "Simulated demo" if mode == "mock" else "Live local recognition",
+            "mockAvailable": True,
+            "liveReady": live_ready,
+            "liveGateEnabled": _genetec_cardholder_face_sync_gate(),
+            "engineAvailable": base["engineAvailable"],
+            "encryptedStorageAvailable": base["encryptedStorageAvailable"],
+            "activeEnrolledByPersonType": base["activeEnrolledByPersonType"],
+            "imageRetention": "Camera frame is processed in memory and is not saved by the kiosk adapter.",
+            "liveGalleryBoundary": "Live mode searches only active, individually approved profiles linked to a Genetec Cardholder portrait and an additional camera sample.",
             "authentication": "not-configured-prototype-only",
         }
 
@@ -484,12 +611,291 @@ class FaceAttendanceStore:
             })
         return {"ok": True, "source": "Genetec Security Center", "readOnly": True, "cardholders": cardholders, "rawCredentialNumbersReturned": False}
 
+    def list_genetec_student_groups(self) -> dict:
+        """Return Cardholder group names/counts only; never export unfiltered people."""
+        _require_genetec_cardholder_face_sync()
+        response = _genetec_bridge_get("/api/genetec/student-roster-groups")
+        source = response.get("groups")
+        if not isinstance(source, list):
+            raise FaceAttendanceError(503, "GENETEC_GROUP_RESPONSE_INVALID", "The bridge did not return a valid Cardholder group catalog.")
+        groups = []
+        seen = set()
+        for item in source[:250]:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if not isinstance(name, str) or not name.strip() or len(name.strip()) > 100:
+                continue
+            name = name.strip()
+            key = name.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            count = item.get("cardholderCount", 0)
+            count = count if isinstance(count, int) and 0 <= count <= 10000 else 0
+            groups.append({"name": name, "cardholderCount": count})
+        if not groups:
+            raise FaceAttendanceError(503, "GENETEC_GROUPS_EMPTY", "The bridge returned no Cardholder group memberships. Verify the installed Genetec SDK's group-membership mapping before importing.")
+        return {"ok": True, "source": "Genetec Security Center", "readOnly": True, "groups": groups,
+                "groupCount": len(groups), "portraitsReturned": False, "rawCredentialNumbersReturned": False}
+
+    def import_genetec_student_roster(self, payload: object) -> dict:
+        """Import bounded Cardholder metadata by explicit groups and/or a verified ID prefix.
+
+        At least one explicit group or a verified External ID prefix is mandatory. Selected
+        group names are exact allowlist matches; this endpoint never performs an unfiltered
+        Cardholder export. Portrait bytes are not stored during bulk import.
+        """
+        _require_genetec_cardholder_face_sync()
+        if not isinstance(payload, dict):
+            raise FaceAttendanceError(400, "INVALID_REQUEST", "Request body must be a JSON object.")
+        prefix_value = payload.get("externalIdPrefix", "")
+        if prefix_value is None:
+            prefix_value = ""
+        if not isinstance(prefix_value, str):
+            raise FaceAttendanceError(400, "STUDENT_ID_PREFIX_INVALID", "External ID prefix must be text.")
+        prefix = prefix_value.strip()
+        if prefix and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}", prefix):
+            raise FaceAttendanceError(400, "STUDENT_ID_PREFIX_INVALID", "External ID prefix may contain only letters, digits, dot, underscore and hyphen (maximum 32 characters).")
+        group_value = payload.get("groupNames", [])
+        if not isinstance(group_value, list):
+            raise FaceAttendanceError(400, "STUDENT_GROUP_FILTER_INVALID", "groupNames must be a list of selected Genetec Cardholder group names.")
+        group_names = []
+        seen_groups = set()
+        for raw_name in group_value:
+            if not isinstance(raw_name, str) or not raw_name.strip() or len(raw_name.strip()) > 100 or "|" in raw_name or any(ord(ch) < 32 for ch in raw_name):
+                raise FaceAttendanceError(400, "STUDENT_GROUP_FILTER_INVALID", "Each selected Genetec group must be a valid name of at most 100 characters.")
+            name = raw_name.strip()
+            if name.casefold() not in seen_groups:
+                group_names.append(name)
+                seen_groups.add(name.casefold())
+        if len(group_names) > 20:
+            raise FaceAttendanceError(400, "STUDENT_GROUP_FILTER_LIMIT", "Select no more than 20 approved student Cardholder groups at once.")
+        if not group_names and not prefix:
+            raise FaceAttendanceError(400, "STUDENT_SCOPE_REQUIRED", "Load Genetec groups and select the approved student-only groups. A verified External ID prefix may be used as an additional or alternative filter. Unfiltered import is disabled.")
+        try:
+            limit = int(payload.get("limit", 1000))
+        except (TypeError, ValueError) as exc:
+            raise FaceAttendanceError(400, "STUDENT_ROSTER_LIMIT_INVALID", "limit must be an integer from 1 to 1000.") from exc
+        if not 1 <= limit <= 1000:
+            raise FaceAttendanceError(400, "STUDENT_ROSTER_LIMIT_INVALID", "limit must be an integer from 1 to 1000.")
+        query = {"limit": str(limit)}
+        if prefix:
+            query["externalIdPrefix"] = prefix
+        if group_names:
+            query["groupNames"] = "|".join(group_names)
+        response = _genetec_bridge_get("/api/genetec/student-roster", query)
+        source = response.get("cardholders")
+        if not isinstance(source, list):
+            raise FaceAttendanceError(503, "GENETEC_ROSTER_RESPONSE_INVALID", "The bridge did not return a valid student roster.")
+        imported = 0
+        inserted = 0
+        updated = 0
+        now = _iso_utc()
+        seen: set[str] = set()
+        scope_label = prefix or ("GROUP:" + "|".join(group_names))
+        with self._lock, closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for item in source:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        guid = str(uuid.UUID(str(item.get("cardholderGuid"))))
+                    except (ValueError, TypeError, AttributeError):
+                        continue
+                    external_id_value = item.get("externalId")
+                    external_id = external_id_value.strip()[:160] if isinstance(external_id_value, str) else ""
+                    source_groups = item.get("cardholderGroups", [])
+                    if not isinstance(source_groups, list):
+                        source_groups = []
+                    normalized_source_groups = [str(x).strip()[:100] for x in source_groups if isinstance(x, str) and x.strip()]
+                    if group_names and not any(g.casefold() in {s.casefold() for s in normalized_source_groups} for g in group_names):
+                        continue
+                    if prefix and (not external_id or not external_id.casefold().startswith(prefix.casefold())):
+                        continue
+                    # Genetec may not expose an External ID for all valid Cardholders. For
+                    # group-scoped imports use a stable, non-secret local reference derived
+                    # from the native GUID rather than dropping the record or using a card number.
+                    if not external_id:
+                        if not group_names:
+                            continue
+                        external_id = "GC-" + guid.replace("-", "").upper()
+                    if guid in seen:
+                        continue
+                    seen.add(guid)
+                    display_name = str(item.get("displayName") or "").strip()[:160]
+                    if not display_name:
+                        display_name = external_id
+                    first_name = str(item.get("firstName") or "").strip()[:100]
+                    last_name = str(item.get("lastName") or "").strip()[:100]
+                    refs = _safe_genetec_credential_refs(item.get("credentialReferences"))
+                    old = conn.execute("SELECT cardholder_guid FROM genetec_cardholder_roster WHERE cardholder_guid=?", (guid,)).fetchone()
+                    conn.execute("""INSERT INTO genetec_cardholder_roster
+                        (cardholder_guid,external_id,display_name,first_name,last_name,photo_available,credential_refs_json,roster_prefix,cardholder_groups_json,imported_at_utc)
+                        VALUES(?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(cardholder_guid) DO UPDATE SET
+                          external_id=excluded.external_id,display_name=excluded.display_name,
+                          first_name=excluded.first_name,last_name=excluded.last_name,
+                          photo_available=excluded.photo_available,credential_refs_json=excluded.credential_refs_json,
+                          roster_prefix=excluded.roster_prefix,cardholder_groups_json=excluded.cardholder_groups_json,imported_at_utc=excluded.imported_at_utc""",
+                        (guid, external_id, display_name, first_name, last_name, 1 if item.get("photoAvailable") is True else 0,
+                         json.dumps(refs, separators=(",", ":")), scope_label,
+                         json.dumps(normalized_source_groups, separators=(",", ":")), now))
+                    imported += 1
+                    if old:
+                        updated += 1
+                    else:
+                        inserted += 1
+                self._audit(conn, "genetec-student-roster-import", None, None, "success", {
+                    "externalIdPrefix": prefix, "groupNames": group_names, "returnedCount": len(source), "acceptedCount": imported,
+                    "insertedCount": inserted, "updatedCount": updated,
+                    "resultsLimited": response.get("resultsLimited") is True,
+                    "imageBytesReturned": response.get("imageBytesReturned") is True,
+                    "rawCredentialNumbersReturned": response.get("rawCredentialNumbersReturned") is True,
+                })
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        roster = self.list_genetec_student_roster("")
+        bridge_matched = response.get("matchedCount")
+        matched_count = int(bridge_matched) if isinstance(bridge_matched, int) and bridge_matched >= 0 else len(source)
+        return {"ok": True, "source": "Genetec Security Center", "readOnly": True,
+                "externalIdPrefix": prefix, "groupNames": group_names, "matchedCount": matched_count,
+                "returnedCount": len(source), "importedCount": imported, "insertedCount": inserted,
+                "updatedCount": updated, "resultsLimited": response.get("resultsLimited") is True,
+                "rawCredentialNumbersReturned": False, "portraitsPersisted": False,
+                "roster": roster.get("cardholders", [])}
+
+    def list_genetec_student_roster(self, search: object = "") -> dict:
+        _require_genetec_cardholder_face_sync()
+        query = search.strip()[:120] if isinstance(search, str) else ""
+        with closing(self._connect()) as conn:
+            if query:
+                like = "%" + query + "%"
+                rows = conn.execute("SELECT * FROM genetec_cardholder_roster WHERE display_name LIKE ? OR external_id LIKE ? ORDER BY display_name LIMIT 1000", (like, like)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM genetec_cardholder_roster ORDER BY display_name LIMIT 1000").fetchall()
+        cardholders = []
+        for row in rows:
+            try:
+                refs = json.loads(row["credential_refs_json"])
+            except (TypeError, json.JSONDecodeError):
+                refs = []
+            try:
+                group_names = json.loads(row["cardholder_groups_json"])
+            except (KeyError, TypeError, json.JSONDecodeError):
+                group_names = []
+            cardholders.append({
+                "cardholderGuid": row["cardholder_guid"], "externalId": row["external_id"],
+                "displayName": row["display_name"], "firstName": row["first_name"], "lastName": row["last_name"],
+                "cardholderGroups": group_names if isinstance(group_names, list) else [],
+                "photoAvailable": bool(row["photo_available"]), "credentialReferences": _safe_genetec_credential_refs(refs),
+                "importedAtUtc": row["imported_at_utc"],
+            })
+        return {"ok": True, "source": "local-imported-Genetec-roster", "count": len(cardholders),
+                "cardholders": cardholders, "portraitsPersisted": False, "rawCredentialNumbersReturned": False}
+
+    def get_genetec_roster_portrait(self, cardholder_guid: object) -> dict:
+        _require_genetec_cardholder_face_sync()
+        try:
+            guid = str(uuid.UUID(str(cardholder_guid)))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise FaceAttendanceError(400, "INVALID_CARDHOLDER_GUID", "Select a Cardholder from the imported roster.") from exc
+        with closing(self._connect()) as conn:
+            known = conn.execute("SELECT photo_available FROM genetec_cardholder_roster WHERE cardholder_guid=?", (guid,)).fetchone()
+        if not known:
+            raise FaceAttendanceError(404, "CARDHOLDER_NOT_IN_ROSTER", "Import the approved student roster before requesting this portrait.")
+        if not known["photo_available"]:
+            raise FaceAttendanceError(422, "CARDHOLDER_PHOTO_UNAVAILABLE", "This Cardholder has no portrait available in Genetec.")
+        response = _genetec_bridge_get("/api/genetec/cardholder-photo", {"cardholderGuid": guid})
+        profile = response.get("cardholder")
+        if not isinstance(profile, dict) or str(profile.get("cardholderGuid", "")).lower() != guid.lower():
+            raise FaceAttendanceError(503, "GENETEC_CARDHOLDER_MISMATCH", "The bridge portrait did not match the selected Cardholder GUID.")
+        mime = response.get("imageMimeType")
+        encoded = response.get("imageBase64")
+        if mime not in {"image/jpeg", "image/png", "image/webp"} or not isinstance(encoded, str) or len(encoded) > MAX_IMAGE_DATA_URL_CHARS:
+            raise FaceAttendanceError(503, "GENETEC_PORTRAIT_INVALID", "The bridge returned an unsupported or oversized portrait.")
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (ValueError, base64.binascii.Error) as exc:
+            raise FaceAttendanceError(503, "GENETEC_PORTRAIT_INVALID", "The bridge returned invalid portrait bytes.") from exc
+        if not raw or len(raw) > MAX_IMAGE_DECODED_BYTES:
+            raise FaceAttendanceError(413, "GENETEC_PORTRAIT_TOO_LARGE", "The portrait exceeds the local size limit.")
+        # The portrait is returned in-memory for staff review and is never saved into SQLite.
+        return {"ok": True, "cardholderGuid": guid, "displayName": str(profile.get("displayName") or "")[:160],
+                "externalId": str(profile.get("externalId") or "")[:160],
+                "imageDataUrl": f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}",
+                "persisted": False, "rawCredentialNumbersReturned": False}
+
+    def record_genetec_roster_attendance(self, cardholder_guid: object, payload: object) -> dict:
+        _require_genetec_cardholder_face_sync()
+        try:
+            guid = str(uuid.UUID(str(cardholder_guid)))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise FaceAttendanceError(400, "INVALID_CARDHOLDER_GUID", "Select a Cardholder from the imported roster.") from exc
+        if not isinstance(payload, dict):
+            raise FaceAttendanceError(400, "INVALID_REQUEST", "Request body must be a JSON object.")
+        if payload.get("portraitViewed") is not True or payload.get("confirmIdentity") is not True:
+            raise FaceAttendanceError(403, "STAFF_PORTRAIT_CONFIRMATION_REQUIRED", "Load and review the selected Genetec portrait, compare it with the person present, and confirm identity before recording attendance.")
+        event_type = _event_type(payload.get("eventType"))
+        session_id = _validate_session(payload.get("sessionId"))
+        operator = payload.get("operator")
+        if not isinstance(operator, str) or not 2 <= len(operator.strip()) <= 100:
+            raise FaceAttendanceError(400, "OPERATOR_REQUIRED", "Enter the authorised staff operator name (2–100 characters).")
+        operator = operator.strip()
+        now = _iso_utc()
+        attendance_id = str(uuid.uuid4())
+        with self._lock, closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute("SELECT * FROM genetec_cardholder_roster WHERE cardholder_guid=?", (guid,)).fetchone()
+                if row is None:
+                    raise FaceAttendanceError(404, "CARDHOLDER_NOT_IN_ROSTER", "Import this Cardholder into the local roster before recording attendance.")
+                if not row["photo_available"]:
+                    raise FaceAttendanceError(422, "CARDHOLDER_PHOTO_UNAVAILABLE", "This workflow requires a Genetec portrait to be available and reviewed.")
+                existing = conn.execute("SELECT attendance_id FROM genetec_cardholder_attendance_events WHERE cardholder_guid=? AND session_id=? AND event_type=?", (guid, session_id, event_type)).fetchone()
+                if existing:
+                    raise FaceAttendanceError(409, "ATTENDANCE_ALREADY_RECORDED", f"{event_type} was already recorded for this Cardholder in this session.")
+                if event_type == "CheckOut":
+                    checkin = conn.execute("SELECT attendance_id FROM genetec_cardholder_attendance_events WHERE cardholder_guid=? AND session_id=? AND event_type='CheckIn'", (guid, session_id)).fetchone()
+                    if not checkin:
+                        raise FaceAttendanceError(409, "CHECKIN_REQUIRED", "Record a staff-confirmed check-in before checkout for this session.")
+                refs = _safe_genetec_credential_refs(json.loads(row["credential_refs_json"]))
+                conn.execute("INSERT INTO genetec_cardholder_attendance_events(attendance_id,cardholder_guid,external_id,display_name,session_id,event_type,occurred_at_utc,operator_name,verification_method,credential_refs_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                             (attendance_id, guid, row["external_id"], row["display_name"], session_id, event_type, now, operator, "staff-confirmed-genetec-portrait-review", json.dumps(refs, separators=(",", ":"))))
+                self._audit(conn, "genetec-cardholder-attendance", row["external_id"], session_id, "success", {"cardholderGuid": guid, "eventType": event_type, "verificationMethod": "staff-confirmed-genetec-portrait-review", "operator": operator})
+                conn.commit()
+                return {"ok": True, "attendanceId": attendance_id, "cardholderGuid": guid, "externalId": row["external_id"], "displayName": row["display_name"], "sessionId": session_id, "eventType": event_type, "occurredAtUtc": now, "operator": operator, "verificationMethod": "staff-confirmed-genetec-portrait-review", "credentialReferences": refs, "writtenToGenetec": False}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def list_genetec_roster_attendance(self, session_id: object = "") -> dict:
+        _require_genetec_cardholder_face_sync()
+        session = session_id.strip()[:96] if isinstance(session_id, str) else ""
+        with closing(self._connect()) as conn:
+            if session:
+                rows = conn.execute("SELECT * FROM genetec_cardholder_attendance_events WHERE session_id=? ORDER BY occurred_at_utc DESC LIMIT 1000", (session,)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM genetec_cardholder_attendance_events ORDER BY occurred_at_utc DESC LIMIT 1000").fetchall()
+        events = []
+        for row in rows:
+            try: refs = json.loads(row["credential_refs_json"])
+            except (TypeError, json.JSONDecodeError): refs = []
+            events.append({"attendanceId": row["attendance_id"], "cardholderGuid": row["cardholder_guid"], "externalId": row["external_id"], "displayName": row["display_name"], "sessionId": row["session_id"], "eventType": row["event_type"], "occurredAtUtc": row["occurred_at_utc"], "operator": row["operator_name"], "credentialReferences": _safe_genetec_credential_refs(refs)})
+        return {"ok": True, "events": events, "count": len(events), "writtenToGenetec": False}
+
     def enroll_from_genetec(self, payload: object) -> dict:
         _require_genetec_cardholder_face_sync()
         if not isinstance(payload, dict):
             raise FaceAttendanceError(400, "INVALID_REQUEST", "Request body must be a JSON object.")
-        if payload.get("guardianConsent") is not True:
-            raise FaceAttendanceError(403, "GUARDIAN_CONSENT_REQUIRED", "A recorded consent/eligibility decision is required before importing a Genetec portrait for biometric attendance.")
+        person_type = _person_type(payload.get("personType", "Student"))
+        if person_type == "Student" and payload.get("guardianConsent") is not True:
+            raise FaceAttendanceError(403, "GUARDIAN_CONSENT_REQUIRED", "A recorded student/guardian consent and eligibility decision is required before importing a Genetec portrait for biometric attendance.")
+        if person_type != "Student" and payload.get("consentConfirmed") is not True:
+            raise FaceAttendanceError(403, "PERSON_CONSENT_REQUIRED", "A recorded individual consent and eligibility decision is required before importing a Genetec portrait for biometric attendance.")
         try:
             cardholder_guid = str(uuid.UUID(str(payload.get("cardholderGuid"))))
         except (ValueError, TypeError, AttributeError) as exc:
@@ -536,13 +942,16 @@ class FaceAttendanceStore:
             else:
                 student_id = "GC-" + cardholder_guid.replace("-", "").upper()
         credential_refs = _safe_genetec_credential_refs(profile.get("credentialReferences"))
+        profile_metadata = _safe_genetec_profile_metadata(profile)
         enrollment_payload = dict(payload)
         enrollment_payload.update({
             "studentId": student_id,
+            "personType": person_type,
             "displayName": display_name,
             "images": [portrait_url] + extra_images,
             "genetecCardholderGuid": cardholder_guid,
             "genetecCredentialReferences": credential_refs,
+            "genetecMetadata": profile_metadata,
         })
         # The regular enrollment path independently re-detects exactly one face per image,
         # enforces the standard consent references and encrypts only normalized crops.
@@ -561,8 +970,11 @@ class FaceAttendanceStore:
         self._assert_ready()
         if not isinstance(payload, dict):
             raise FaceAttendanceError(400, "INVALID_REQUEST", "Request body must be a JSON object.")
-        if payload.get("guardianConsent") is not True:
-            raise FaceAttendanceError(403, "GUARDIAN_CONSENT_REQUIRED", "A recorded consent/eligibility decision is required before enrollment.")
+        person_type = _person_type(payload.get("personType", "Student"))
+        if person_type == "Student" and payload.get("guardianConsent") is not True:
+            raise FaceAttendanceError(403, "GUARDIAN_CONSENT_REQUIRED", "A recorded student/guardian consent and eligibility decision is required before enrollment.")
+        if person_type != "Student" and payload.get("consentConfirmed") is not True:
+            raise FaceAttendanceError(403, "PERSON_CONSENT_REQUIRED", "A recorded individual consent and eligibility decision is required before enrollment.")
         student_id = _validate_id(payload.get("studentId"))
         name = payload.get("displayName")
         class_name = payload.get("className")
@@ -587,6 +999,9 @@ class FaceAttendanceStore:
             except (ValueError, TypeError, AttributeError) as exc:
                 raise FaceAttendanceError(400, "INVALID_CARDHOLDER_GUID", "genetecCardholderGuid must be a GUID returned by Genetec.") from exc
         genetec_credential_refs = _safe_genetec_credential_refs(payload.get("genetecCredentialReferences"))
+        genetec_metadata = _safe_genetec_profile_metadata(payload.get("genetecMetadata"))
+        metadata_json = json.dumps(genetec_metadata, separators=(",", ":"))
+        credential_json = json.dumps(genetec_credential_refs, separators=(",", ":"))
         # Each capture must contain exactly one detected face. A group image is rejected.
         samples = []
         for item in images:
@@ -617,30 +1032,32 @@ class FaceAttendanceStore:
                     conn.execute("ROLLBACK")
                     raise FaceAttendanceError(409, "GENETEC_CARDHOLDER_ALREADY_LINKED", "This Genetec Cardholder is already linked to another attendance profile. Reconcile the existing mapping instead of creating a duplicate.")
             if existing:
-                conn.execute("UPDATE face_enrollments SET display_name=?,class_name=?,consent_reference=?,school_approval_reference=?,approved_by=?,enrolled_at_utc=?,active=1,genetec_cardholder_guid=?,genetec_credential_refs_json=? WHERE student_id=?", (name.strip(), class_name.strip(), consent_ref, approval_ref, approved_by.strip(), now, genetec_cardholder_guid, json.dumps(genetec_credential_refs, separators=(",", ":")), student_id))
+                conn.execute("UPDATE face_enrollments SET display_name=?,class_name=?,person_type=?,consent_reference=?,school_approval_reference=?,approved_by=?,enrolled_at_utc=?,active=1,genetec_cardholder_guid=?,genetec_credential_refs_json=?,genetec_metadata_json=? WHERE student_id=?", (name.strip(), class_name.strip(), person_type, consent_ref, approval_ref, approved_by.strip(), now, genetec_cardholder_guid, credential_json, metadata_json, student_id))
                 conn.execute("DELETE FROM face_samples WHERE student_id=?", (student_id,))
             else:
                 try:
-                    conn.execute("INSERT INTO face_enrollments(student_id,display_name,class_name,consent_reference,school_approval_reference,approved_by,enrolled_at_utc,active,genetec_cardholder_guid,genetec_credential_refs_json) VALUES(?,?,?,?,?,?,?,1,?,?)", (student_id, name.strip(), class_name.strip(), consent_ref, approval_ref, approved_by.strip(), now, genetec_cardholder_guid, json.dumps(genetec_credential_refs, separators=(",", ":"))))
+                    conn.execute("INSERT INTO face_enrollments(student_id,display_name,class_name,person_type,consent_reference,school_approval_reference,approved_by,enrolled_at_utc,active,genetec_cardholder_guid,genetec_credential_refs_json,genetec_metadata_json) VALUES(?,?,?,?,?,?,?, ?,1,?,?,?)", (student_id, name.strip(), class_name.strip(), person_type, consent_ref, approval_ref, approved_by.strip(), now, genetec_cardholder_guid, credential_json, metadata_json))
                 except sqlite3.IntegrityError as exc:
                     conn.execute("ROLLBACK")
                     if genetec_cardholder_guid:
                         raise FaceAttendanceError(409, "GENETEC_CARDHOLDER_ALREADY_LINKED", "This Genetec Cardholder is already linked to another attendance profile. Reconcile the existing mapping instead of creating a duplicate.") from exc
                     raise
             conn.executemany("INSERT INTO face_samples(student_id,sample_no,protected_sample,created_at_utc) VALUES(?,?,?,?)", [(student_id, idx + 1, blob, now) for idx, blob in enumerate(protected)])
-            self._audit(conn, "FaceEnrollmentCreated", student_id, None, "Success", {"sampleCount": len(protected), "consentReference": consent_ref, "schoolApprovalReference": approval_ref, "approvedBy": approved_by.strip(), "rawImagesPersisted": False, "identitySource": "GenetecCardholder" if genetec_cardholder_guid else "Manual", "genetecCardholderGuid": genetec_cardholder_guid, "genetecCredentialReferenceCount": len(genetec_credential_refs)})
+            self._audit(conn, "FaceEnrollmentCreated", student_id, None, "Success", {"personType": person_type, "sampleCount": len(protected), "consentReference": consent_ref, "schoolApprovalReference": approval_ref, "approvedBy": approved_by.strip(), "rawImagesPersisted": False, "identitySource": "GenetecCardholder" if genetec_cardholder_guid else "Manual", "genetecCardholderGuid": genetec_cardholder_guid, "genetecCredentialReferenceCount": len(genetec_credential_refs), "genetecMetadataKeys": sorted(genetec_metadata.keys())})
             conn.execute("COMMIT")
-        return {"ok": True, "studentId": student_id, "displayName": name.strip(), "className": class_name.strip(), "sampleCount": len(protected), "enrolledAtUtc": now, "rawImagesPersisted": False, "identitySource": "GenetecCardholder" if genetec_cardholder_guid else "Manual", "genetecCardholderGuid": genetec_cardholder_guid, "genetecCredentialReferenceCount": len(genetec_credential_refs), "message": "Encrypted individual face samples stored locally. Capture frames and group photos are not retained."}
+        return {"ok": True, "studentId": student_id, "personType": person_type, "displayName": name.strip(), "className": class_name.strip(), "sampleCount": len(protected), "enrolledAtUtc": now, "rawImagesPersisted": False, "identitySource": "GenetecCardholder" if genetec_cardholder_guid else "Manual", "genetecCardholderGuid": genetec_cardholder_guid, "genetecCredentialReferenceCount": len(genetec_credential_refs), "genetecMetadata": genetec_metadata, "message": "Encrypted individual face crops stored locally. Raw source portraits and camera frames are not retained."}
 
     def list_students(self) -> dict:
         self._assert_ready()
         with closing(self._connect()) as conn:
-            rows = conn.execute("SELECT student_id,display_name,class_name,enrolled_at_utc,genetec_cardholder_guid,genetec_credential_refs_json FROM face_enrollments WHERE active=1 ORDER BY display_name COLLATE NOCASE").fetchall()
+            rows = conn.execute("SELECT student_id,display_name,class_name,person_type,enrolled_at_utc,genetec_cardholder_guid,genetec_credential_refs_json,genetec_metadata_json FROM face_enrollments WHERE active=1 ORDER BY person_type,display_name COLLATE NOCASE").fetchall()
         students = []
         for r in rows:
             try: credential_refs = _safe_genetec_credential_refs(json.loads(r["genetec_credential_refs_json"] or "[]"))
             except Exception: credential_refs = []
-            students.append({"studentId": r["student_id"], "displayName": r["display_name"], "className": r["class_name"], "enrolledAtUtc": r["enrolled_at_utc"], "genetecCardholderGuid": r["genetec_cardholder_guid"], "genetecCredentialReferences": credential_refs})
+            try: metadata = _safe_genetec_profile_metadata(json.loads(r["genetec_metadata_json"] or "{}"))
+            except Exception: metadata = {}
+            students.append({"studentId": r["student_id"], "personType": r["person_type"], "displayName": r["display_name"], "className": r["class_name"], "enrolledAtUtc": r["enrolled_at_utc"], "genetecCardholderGuid": r["genetec_cardholder_guid"], "genetecCredentialReferences": credential_refs, "genetecMetadata": metadata})
         return {"ok": True, "students": students}
 
     def revoke_enrollment(self, student_id: object, payload: object) -> dict:
@@ -664,25 +1081,36 @@ class FaceAttendanceStore:
             conn.execute("COMMIT")
         return {"ok": True, "studentId": student_id, "enrollmentActive": False, "samplesDeleted": True}
 
-    def _training_data(self, student_ids: list[str] | None = None):
+    def _training_data(self, student_ids: list[str] | None = None, *, person_type: str | None = None, genetec_only: bool = False):
         self._assert_ready()
         cv2, np = _opencv_module()
         assert cv2 is not None and np is not None
         with closing(self._connect()) as conn:
-            if student_ids is None:
-                profiles = conn.execute("SELECT student_id,display_name,class_name,genetec_cardholder_guid,genetec_credential_refs_json FROM face_enrollments WHERE active=1 ORDER BY student_id").fetchall()
-            elif not student_ids:
+            if student_ids is not None and not student_ids:
                 profiles = []
             else:
-                placeholders = ",".join("?" for _ in student_ids)
-                profiles = conn.execute(f"SELECT student_id,display_name,class_name,genetec_cardholder_guid,genetec_credential_refs_json FROM face_enrollments WHERE active=1 AND student_id IN ({placeholders}) ORDER BY student_id", tuple(student_ids)).fetchall()
+                clauses = ["active=1"]
+                params: list[object] = []
+                if person_type:
+                    clauses.append("person_type=?")
+                    params.append(person_type)
+                if genetec_only:
+                    clauses.append("genetec_cardholder_guid IS NOT NULL")
+                if student_ids is not None:
+                    placeholders = ",".join("?" for _ in student_ids)
+                    clauses.append(f"student_id IN ({placeholders})")
+                    params.extend(student_ids)
+                sql = "SELECT student_id,display_name,class_name,person_type,genetec_cardholder_guid,genetec_credential_refs_json,genetec_metadata_json FROM face_enrollments WHERE " + " AND ".join(clauses) + " ORDER BY student_id"
+                profiles = conn.execute(sql, tuple(params)).fetchall()
             labels_by_id = {row["student_id"]: idx + 1 for idx, row in enumerate(profiles)}
             id_by_label = {idx + 1: row["student_id"] for idx, row in enumerate(profiles)}
             profile_by_id = {}
             for row in profiles:
                 try: credential_refs = _safe_genetec_credential_refs(json.loads(row["genetec_credential_refs_json"] or "[]"))
                 except Exception: credential_refs = []
-                profile_by_id[row["student_id"]] = {"studentId": row["student_id"], "displayName": row["display_name"], "className": row["class_name"], "genetecCardholderGuid": row["genetec_cardholder_guid"], "genetecCredentialReferences": credential_refs}
+                try: metadata = _safe_genetec_profile_metadata(json.loads(row["genetec_metadata_json"] or "{}"))
+                except Exception: metadata = {}
+                profile_by_id[row["student_id"]] = {"studentId": row["student_id"], "personType": row["person_type"], "displayName": row["display_name"], "className": row["class_name"], "genetecCardholderGuid": row["genetec_cardholder_guid"], "genetecCredentialReferences": credential_refs, **metadata}
             if not profiles:
                 raise FaceAttendanceError(409, "NO_CONSENTED_ENROLLMENTS", "No active, approved, consented face enrollments are available for this scope.")
             images, labels = [], []
@@ -711,22 +1139,180 @@ class FaceAttendanceStore:
             conn.execute("INSERT INTO face_match_tickets(ticket_id,mode,session_id,event_type,student_id,group_event_id,distance,created_at_utc,expires_at_utc) VALUES(?,?,?,?,?,?,?,?,?)", (ticket, mode, session_id, event_type, student_id, group_event_id, float(distance), _iso_utc(now), _iso_utc(now + timedelta(seconds=TICKET_TTL_SECONDS))))
         return ticket
 
-    def match_student(self, payload: object) -> dict:
+    def match_student(self, payload: object, *, genetec_only: bool = False) -> dict:
         self._assert_ready()
         if not isinstance(payload, dict):
             raise FaceAttendanceError(400, "INVALID_REQUEST", "Request body must be a JSON object.")
+        person_type = _person_type(payload.get("personType", "Student"))
         event_type = _event_type(payload.get("eventType"))
         session_id = _validate_session(payload.get("sessionId"))
         faces = _extract_faces(payload.get("imageData"), max_faces=2)
         if len(faces) != 1:
-            raise FaceAttendanceError(422, "SINGLE_FACE_REQUIRED", "Student attendance expects exactly one face in the camera frame. Use the group flow only for an approved roster and group event.")
-        recognizer, id_by_label, profiles, max_distance = self._training_data()
+            raise FaceAttendanceError(422, "SINGLE_FACE_REQUIRED", "Kiosk attendance expects exactly one face in the camera frame. Group matching is a separate, explicitly gated workflow.")
+        recognizer, id_by_label, profiles, max_distance = self._training_data(person_type=person_type, genetec_only=genetec_only)
         label, distance = recognizer.predict(_decode_crop(faces[0]))
         student_id = id_by_label.get(int(label))
         if not student_id or float(distance) > max_distance:
-            return {"ok": True, "matched": False, "reason": "NO_CONFIDENT_MATCH", "message": "No eligible enrolled face matched the configured threshold. Use the normal staff/QR attendance path; do not force a match.", "humanConfirmationRequired": True}
+            return {"ok": True, "matched": False, "reason": "NO_CONFIDENT_MATCH", "personType": person_type, "message": f"No eligible {person_type.lower()} identity matched the configured threshold. Use the approved staff-assisted attendance path; do not force a match.", "humanConfirmationRequired": True}
         ticket = self._new_ticket("student", session_id, event_type, student_id, "", float(distance))
-        return {"ok": True, "matched": True, "candidate": profiles[student_id], "distance": round(float(distance), 3), "ticketId": ticket, "ticketExpiresInSeconds": TICKET_TTL_SECONDS, "humanConfirmationRequired": True, "rawImagePersisted": False, "message": "Candidate only. An authorised staff operator must confirm the identity before recording attendance."}
+        return {"ok": True, "matched": True, "candidate": profiles[student_id], "personType": person_type, "distance": round(float(distance), 3), "ticketId": ticket, "ticketExpiresInSeconds": TICKET_TTL_SECONDS, "humanConfirmationRequired": True, "rawImagePersisted": False, "message": "Candidate only. Confirm the displayed identity before recording attendance."}
+
+    @staticmethod
+    def _mock_person(person_type: str) -> dict:
+        """Synthetic profile data for a repeatable kiosk demo; never sourced from Genetec."""
+        profiles = {
+            "Student": {
+                "studentId": "STU-DEMO-10482", "personType": "Student", "displayName": "Ava Thompson",
+                "firstName": "Ava", "lastName": "Thompson", "externalId": "STU-DEMO-10482",
+                "className": "Grade 8B", "cardholderStatus": "Active", "cardholderGroups": ["Demo Students"],
+                "genetecCardholderGuid": "11111111-1111-4111-8111-111111111111",
+                "genetecCredentialReferences": [{"guid": "22222222-2222-4222-8222-222222222222", "name": "Demo access card", "maskedIdentifier": "••••1048", "active": True}],
+            },
+            "Staff": {
+                "studentId": "STF-DEMO-02047", "personType": "Staff", "displayName": "James Carter",
+                "firstName": "James", "lastName": "Carter", "externalId": "STF-DEMO-02047",
+                "className": "Science Department", "cardholderStatus": "Active", "cardholderGroups": ["Demo Staff", "Faculty"],
+                "genetecCardholderGuid": "33333333-3333-4333-8333-333333333333",
+                "genetecCredentialReferences": [{"guid": "44444444-4444-4444-8444-444444444444", "name": "Demo staff card", "maskedIdentifier": "••••2047", "active": True}],
+            },
+            "Contractor": {
+                "studentId": "CTR-DEMO-00301", "personType": "Contractor", "displayName": "Morgan Lee",
+                "firstName": "Morgan", "lastName": "Lee", "externalId": "CTR-DEMO-00301",
+                "className": "Northstar Facilities · Maintenance", "cardholderStatus": "Active", "cardholderGroups": ["Demo Contractors", "Facilities"],
+                "genetecCardholderGuid": "55555555-5555-4555-8555-555555555555",
+                "genetecCredentialReferences": [{"guid": "66666666-6666-4666-8666-666666666666", "name": "Demo contractor card", "maskedIdentifier": "••••0301", "active": True}],
+            },
+        }
+        # Copies prevent callers from mutating the process-level demo catalogue.
+        return json.loads(json.dumps(profiles[person_type]))
+
+    def mock_kiosk_match(self, payload: object) -> dict:
+        """Return a clearly labelled synthetic match after a browser camera capture."""
+        if not isinstance(payload, dict):
+            raise FaceAttendanceError(400, "INVALID_REQUEST", "Request body must be a JSON object.")
+        person_type = _person_type(payload.get("personType"))
+        event_type = _event_type(payload.get("eventType", "CheckIn"))
+        session_id = _validate_session(payload.get("sessionId"))
+        image_data = payload.get("imageData")
+        if not isinstance(image_data, str) or len(image_data) > MAX_IMAGE_DATA_URL_CHARS or not DATA_URL_RE.fullmatch(image_data.strip()):
+            raise FaceAttendanceError(400, "INVALID_IMAGE", "A live webcam capture in JPEG, PNG or WebP data-URL format is required for the demo flow.")
+        # Do not decode, log or persist the camera data in mock mode. The identity is scripted.
+        candidate = self._mock_person(person_type)
+        ticket = secrets.token_urlsafe(24)
+        now = _now_utc()
+        with self._lock, closing(self._connect()) as conn:
+            conn.execute(
+                "INSERT INTO kiosk_face_mock_tickets(ticket_id,person_type,person_id,session_id,event_type,created_at_utc,expires_at_utc) VALUES(?,?,?,?,?,?,?)",
+                (ticket, person_type, candidate["studentId"], session_id, event_type, _iso_utc(now), _iso_utc(now + timedelta(seconds=TICKET_TTL_SECONDS))),
+            )
+        return {
+            "ok": True, "mode": "mock", "simulated": True, "matched": True, "candidate": candidate,
+            "ticketId": ticket, "ticketExpiresInSeconds": TICKET_TTL_SECONDS,
+            "rawImagePersisted": False, "humanConfirmationRequired": True,
+            "message": "SIMULATED DEMO MATCH: the webcam was captured but this identity is scripted synthetic data, not a biometric recognition result.",
+        }
+
+    def confirm_mock_kiosk_attendance(self, payload: object) -> dict:
+        if not isinstance(payload, dict) or payload.get("confirmMatch") is not True:
+            raise FaceAttendanceError(400, "HUMAN_CONFIRMATION_REQUIRED", "Confirm the displayed synthetic identity before recording demo attendance.")
+        ticket_id = payload.get("ticketId")
+        if not isinstance(ticket_id, str) or not 24 <= len(ticket_id) <= 80:
+            raise FaceAttendanceError(400, "INVALID_MATCH_TICKET", "The demo match ticket is invalid. Scan again.")
+        now = _now_utc()
+        with self._lock, closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                ticket = conn.execute("SELECT * FROM kiosk_face_mock_tickets WHERE ticket_id=?", (ticket_id,)).fetchone()
+                if ticket is None:
+                    raise FaceAttendanceError(404, "MATCH_TICKET_NOT_FOUND", "Demo match ticket not found. Scan again.")
+                if ticket["consumed_at_utc"]:
+                    raise FaceAttendanceError(409, "MATCH_TICKET_ALREADY_USED", "This scan was already used. Start a new scan.")
+                if datetime.fromisoformat(ticket["expires_at_utc"].replace("Z", "+00:00")) <= now:
+                    raise FaceAttendanceError(409, "MATCH_TICKET_EXPIRED", "The scan expired. Please scan again.")
+                person = self._mock_person(ticket["person_type"])
+                if payload.get("sessionId") and _validate_session(payload.get("sessionId")) != ticket["session_id"]:
+                    raise FaceAttendanceError(409, "MATCH_SESSION_MISMATCH", "This scan belongs to a different attendance session.")
+                if ticket["event_type"] == "CheckOut":
+                    checked_in = conn.execute("SELECT attendance_id FROM kiosk_face_mock_attendance_events WHERE person_type=? AND person_id=? AND session_id=? AND event_type='CheckIn'", (ticket["person_type"], ticket["person_id"], ticket["session_id"])).fetchone()
+                    if not checked_in:
+                        raise FaceAttendanceError(409, "CHECKIN_REQUIRED", "Record check-in before checkout for this attendance session.")
+                attendance_id = "KMOCK-" + secrets.token_hex(8).upper()
+                occurred_at = _iso_utc(now)
+                refs = _safe_genetec_credential_refs(person["genetecCredentialReferences"])
+                try:
+                    conn.execute(
+                        "INSERT INTO kiosk_face_mock_attendance_events(attendance_id,person_type,person_id,display_name,external_id,affiliation,cardholder_guid,credential_refs_json,session_id,event_type,occurred_at_utc,confirmation_method,ticket_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (attendance_id, ticket["person_type"], ticket["person_id"], person["displayName"], person["externalId"], person["className"], person["genetecCardholderGuid"], json.dumps(refs, separators=(",", ":")), ticket["session_id"], ticket["event_type"], occurred_at, "demo-self-confirmed", ticket_id),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise FaceAttendanceError(409, "KIOSK_ATTENDANCE_ALREADY_MARKED", f"{ticket['event_type']} is already recorded for this synthetic {ticket['person_type'].lower()} in this session.") from exc
+                conn.execute("UPDATE kiosk_face_mock_tickets SET consumed_at_utc=? WHERE ticket_id=?", (occurred_at, ticket_id))
+                self._audit(conn, "KioskDemoAttendanceRecorded", ticket["person_id"], ticket["session_id"], "SimulationOnly", {"personType": ticket["person_type"], "eventType": ticket["event_type"], "ticketId": ticket_id, "confirmationMethod": "demo-self-confirmed", "identitySource": "synthetic-demo-adapter"})
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return {"ok": True, "mode": "mock", "simulated": True, "attendanceId": attendance_id, "studentId": person["studentId"], "personType": ticket["person_type"], "displayName": person["displayName"], "className": person["className"], "sessionId": ticket["session_id"], "eventType": ticket["event_type"], "occurredAtUtc": occurred_at, "confirmationMethod": "demo-self-confirmed", "writtenToGenetec": False, "message": "Demo attendance was written to the local synthetic ledger only. Genetec was not changed."}
+
+    def match_kiosk_face(self, payload: object) -> dict:
+        mode = _kiosk_mode()
+        if mode == "mock":
+            return self.mock_kiosk_match(payload)
+        _require_genetec_cardholder_face_sync()
+        result = self.match_student(payload, genetec_only=True)
+        result["mode"] = "live"
+        result["simulated"] = False
+        return result
+
+    def confirm_kiosk_face(self, payload: object) -> dict:
+        mode = _kiosk_mode()
+        if mode == "mock":
+            return self.confirm_mock_kiosk_attendance(payload)
+        _require_genetec_cardholder_face_sync()
+        if not isinstance(payload, dict) or payload.get("confirmMatch") is not True:
+            raise FaceAttendanceError(400, "HUMAN_CONFIRMATION_REQUIRED", "Confirm that the displayed identity is yours before recording attendance.")
+        # This method is distinct from the staff-review API so the audit record does not
+        # falsely attribute a kiosk self-confirmation to an operator.
+        return self.confirm_student(payload, confirmation_method="KioskSelfConfirmed")
+
+    def list_kiosk_events(self, session_id: object = "") -> dict:
+        session = session_id.strip()[:96] if isinstance(session_id, str) else ""
+        if _kiosk_mode() == "live":
+            if not session:
+                raise FaceAttendanceError(400, "SESSION_REQUIRED", "Provide the kiosk attendance session ID.")
+            result = self.list_events(session)
+            events = []
+            for item in result["events"]:
+                events.append({
+                    "attendanceId": item["attendance_id"], "personId": item["student_id"],
+                    "personType": item["person_type"], "displayName": item["display_name"],
+                    "affiliation": item["class_name"], "sessionId": item["session_id"],
+                    "eventType": item["event_type"], "occurredAtUtc": item["occurred_at_utc"],
+                    "confirmationMethod": "KioskSelfConfirmed" if item["operator_name"] == "Kiosk self-confirmed" else "StaffVerified",
+                    "simulated": False,
+                })
+            return {"ok": True, "mode": "live", "sessionId": session, "events": events, "count": len(events), "writtenToGenetec": False}
+        with closing(self._connect()) as conn:
+            if session:
+                rows = conn.execute("SELECT attendance_id,person_type,person_id,display_name,external_id,affiliation,cardholder_guid,credential_refs_json,session_id,event_type,occurred_at_utc,confirmation_method FROM kiosk_face_mock_attendance_events WHERE session_id=? ORDER BY occurred_at_utc DESC LIMIT 100", (session,)).fetchall()
+            else:
+                rows = conn.execute("SELECT attendance_id,person_type,person_id,display_name,external_id,affiliation,cardholder_guid,credential_refs_json,session_id,event_type,occurred_at_utc,confirmation_method FROM kiosk_face_mock_attendance_events ORDER BY occurred_at_utc DESC LIMIT 100").fetchall()
+        events = []
+        for row in rows:
+            try:
+                credential_refs = _safe_genetec_credential_refs(json.loads(row["credential_refs_json"] or "[]"))
+            except Exception:
+                credential_refs = []
+            events.append({
+                "attendanceId": row["attendance_id"], "personId": row["person_id"],
+                "personType": row["person_type"], "displayName": row["display_name"],
+                "externalId": row["external_id"], "affiliation": row["affiliation"],
+                "cardholderGuid": row["cardholder_guid"], "credentialReferences": credential_refs,
+                "sessionId": row["session_id"], "eventType": row["event_type"],
+                "occurredAtUtc": row["occurred_at_utc"], "confirmationMethod": row["confirmation_method"],
+                "simulated": True,
+            })
+        return {"ok": True, "mode": "mock", "sessionId": session or None, "events": events, "count": len(events), "writtenToGenetec": False}
 
     def match_group(self, payload: object) -> dict:
         self._assert_ready(group=True)
@@ -740,7 +1326,7 @@ class FaceAttendanceStore:
             raise FaceAttendanceError(400, "INVALID_ROSTER", f"studentIds must contain 1–{MAX_ROSTER_SIZE} pre-enrolled roster IDs.")
         roster_ids = list(dict.fromkeys(_validate_id(item) for item in roster_raw))
         faces = _extract_faces(payload.get("imageData"), max_faces=MAX_GROUP_FACES)
-        recognizer, id_by_label, profiles, max_distance = self._training_data(roster_ids)
+        recognizer, id_by_label, profiles, max_distance = self._training_data(roster_ids, person_type="Student")
         candidates = []
         seen_students: set[str] = set()
         for index, crop in enumerate(faces, start=1):
@@ -788,28 +1374,33 @@ class FaceAttendanceStore:
                 raise FaceAttendanceError(409, "CHECKIN_REQUIRED", "Checkout is blocked until a verified check-in exists for the same attendance session/group event.")
         return row, student_id, operator.strip()
 
-    def confirm_student(self, payload: object) -> dict:
+    def confirm_student(self, payload: object, *, confirmation_method: str = "StaffVerified") -> dict:
         self._assert_ready()
         if not isinstance(payload, dict) or payload.get("confirmMatch") is not True:
-            raise FaceAttendanceError(400, "HUMAN_CONFIRMATION_REQUIRED", "Set confirmMatch=true after an authorised staff member checks the candidate.")
+            raise FaceAttendanceError(400, "HUMAN_CONFIRMATION_REQUIRED", "Set confirmMatch=true after the displayed candidate has been checked.")
         ticket_id = payload.get("ticketId")
         student_id = payload.get("studentId")
-        operator = payload.get("operator")
+        if confirmation_method == "KioskSelfConfirmed":
+            operator = "Kiosk self-confirmed"
+        elif confirmation_method == "StaffVerified":
+            operator = payload.get("operator")
+        else:
+            raise FaceAttendanceError(500, "INVALID_CONFIRMATION_METHOD", "Attendance confirmation method is not supported.")
         with self._lock, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row, student_id, operator = self._confirm_in_tx(conn, ticket_id, student_id, operator, "student", payload.get("sessionId"), None)
                 attendance_id = "ATT-" + secrets.token_hex(12).upper()
                 now = _iso_utc()
-                identity_link = conn.execute("SELECT genetec_cardholder_guid,genetec_credential_refs_json FROM face_enrollments WHERE student_id=?", (student_id,)).fetchone()
+                identity_link = conn.execute("SELECT person_type,genetec_cardholder_guid,genetec_credential_refs_json FROM face_enrollments WHERE student_id=?", (student_id,)).fetchone()
                 conn.execute("INSERT INTO student_attendance_events(attendance_id,student_id,session_id,event_type,group_event_id,occurred_at_utc,operator_name,ticket_id,model_distance,genetec_cardholder_guid,genetec_credential_refs_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (attendance_id, student_id, row["session_id"], row["event_type"], row["group_event_id"], now, operator, ticket_id, row["distance"], identity_link["genetec_cardholder_guid"], identity_link["genetec_credential_refs_json"]))
                 conn.execute("UPDATE face_match_tickets SET consumed_at_utc=? WHERE ticket_id=?", (now, ticket_id))
-                self._audit(conn, "StudentAttendanceRecorded", student_id, row["session_id"], "Success", {"eventType": row["event_type"], "groupEventId": row["group_event_id"], "operator": operator, "ticketId": ticket_id, "modelDistance": round(float(row["distance"]), 3)})
+                self._audit(conn, "KioskAttendanceRecorded" if confirmation_method == "KioskSelfConfirmed" else "StudentAttendanceRecorded", student_id, row["session_id"], "Success", {"personType": identity_link["person_type"], "eventType": row["event_type"], "groupEventId": row["group_event_id"], "operator": operator, "confirmationMethod": confirmation_method, "ticketId": ticket_id, "modelDistance": round(float(row["distance"]), 3)})
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
-        return {"ok": True, "attendanceId": attendance_id, "studentId": student_id, "sessionId": row["session_id"], "groupEventId": row["group_event_id"] or None, "eventType": row["event_type"], "occurredAtUtc": now, "operator": operator, "humanConfirmed": True}
+        return {"ok": True, "attendanceId": attendance_id, "studentId": student_id, "personType": identity_link["person_type"], "sessionId": row["session_id"], "groupEventId": row["group_event_id"] or None, "eventType": row["event_type"], "occurredAtUtc": now, "operator": operator, "confirmationMethod": confirmation_method, "humanConfirmed": True}
 
     def confirm_group_batch(self, payload: object) -> dict:
         self._assert_ready(group=True)
@@ -842,11 +1433,11 @@ class FaceAttendanceStore:
                 for row, student_id, actor in checked:
                     ticket_id = row["ticket_id"]
                     attendance_id = "ATT-" + secrets.token_hex(12).upper()
-                    identity_link = conn.execute("SELECT genetec_cardholder_guid,genetec_credential_refs_json FROM face_enrollments WHERE student_id=?", (student_id,)).fetchone()
+                    identity_link = conn.execute("SELECT person_type,genetec_cardholder_guid,genetec_credential_refs_json FROM face_enrollments WHERE student_id=?", (student_id,)).fetchone()
                     conn.execute("INSERT INTO student_attendance_events(attendance_id,student_id,session_id,event_type,group_event_id,occurred_at_utc,operator_name,ticket_id,model_distance,genetec_cardholder_guid,genetec_credential_refs_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (attendance_id, student_id, session_id, row["event_type"], group_event_id, now, actor, ticket_id, row["distance"], identity_link["genetec_cardholder_guid"], identity_link["genetec_credential_refs_json"]))
                     conn.execute("UPDATE face_match_tickets SET consumed_at_utc=? WHERE ticket_id=?", (now, ticket_id))
                     self._audit(conn, "GroupAttendanceRecorded", student_id, session_id, "Success", {"eventType": row["event_type"], "groupEventId": group_event_id, "operator": actor, "ticketId": ticket_id, "modelDistance": round(float(row["distance"]), 3)})
-                    result_rows.append({"attendanceId": attendance_id, "studentId": student_id, "eventType": row["event_type"], "occurredAtUtc": now, "operator": actor, "humanConfirmed": True})
+                    result_rows.append({"attendanceId": attendance_id, "studentId": student_id, "personType": identity_link["person_type"], "eventType": row["event_type"], "occurredAtUtc": now, "operator": actor, "humanConfirmed": True})
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
@@ -861,7 +1452,7 @@ class FaceAttendanceStore:
         else:
             group_event_id = ""
         with closing(self._connect()) as conn:
-            rows = conn.execute("SELECT e.attendance_id,e.student_id,p.display_name,p.class_name,e.session_id,e.event_type,e.group_event_id,e.occurred_at_utc,e.operator_name,e.genetec_cardholder_guid,e.genetec_credential_refs_json FROM student_attendance_events e JOIN face_enrollments p USING(student_id) WHERE e.session_id=? AND e.group_event_id=? ORDER BY e.occurred_at_utc", (session_id, group_event_id)).fetchall()
+            rows = conn.execute("SELECT e.attendance_id,e.student_id,p.display_name,p.class_name,p.person_type,e.session_id,e.event_type,e.group_event_id,e.occurred_at_utc,e.operator_name,e.genetec_cardholder_guid,e.genetec_credential_refs_json FROM student_attendance_events e JOIN face_enrollments p USING(student_id) WHERE e.session_id=? AND e.group_event_id=? ORDER BY e.occurred_at_utc", (session_id, group_event_id)).fetchall()
         events = []
         for row in rows:
             item = dict(row)

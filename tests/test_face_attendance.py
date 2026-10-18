@@ -214,7 +214,10 @@ class FaceAttendanceTests(unittest.TestCase):
             "cardholder": {
                 "cardholderGuid": cardholder_guid,
                 "displayName": "Test Cardholder",
+                "firstName": "Test",
+                "lastName": "Cardholder",
                 "externalId": external_id,
+                "cardholderGroups": ["Stamford Test Group", "Faculty"],
                 "credentialReferences": [{
                     "guid": credential_guid,
                     "name": "Assigned card",
@@ -280,16 +283,32 @@ class FaceAttendanceTests(unittest.TestCase):
         self.assertEqual(result["sampleCount"], 2)
         self.assertFalse(result["genetecPhotoPersistedAsRawImage"])
         self.assertFalse(result["rawCredentialNumbersReturned"])
+        self.assertEqual(result["genetecMetadata"]["firstName"], "Test")
+        self.assertEqual(result["genetecMetadata"]["cardholderGroups"], ["Stamford Test Group", "Faculty"])
         with closing(self.store._connect()) as conn:
-            enrollment = conn.execute("SELECT genetec_cardholder_guid,genetec_credential_refs_json FROM face_enrollments WHERE student_id=?", ("S201",)).fetchone()
+            enrollment = conn.execute("SELECT genetec_cardholder_guid,genetec_credential_refs_json,genetec_metadata_json FROM face_enrollments WHERE student_id=?", ("S201",)).fetchone()
             samples = conn.execute("SELECT protected_sample FROM face_samples WHERE student_id=? ORDER BY sample_no", ("S201",)).fetchall()
         self.assertEqual(enrollment["genetec_cardholder_guid"], payload["cardholderGuid"])
         stored_credential_refs = json.loads(enrollment["genetec_credential_refs_json"])
         self.assertEqual(stored_credential_refs[0]["maskedIdentifier"], "••••5678")
         self.assertNotIn("123456789012", enrollment["genetec_credential_refs_json"])
+        stored_metadata = json.loads(enrollment["genetec_metadata_json"])
+        self.assertEqual(stored_metadata["externalId"], "S201")
+        self.assertEqual(stored_metadata["cardholderGroups"], ["Stamford Test Group", "Faculty"])
         self.assertEqual(len(samples), 2)
         self.assertTrue(all(bytes(item["protected_sample"]).startswith(b"encrypted:") for item in samples))
         self.assertNotIn(image_bytes, b"".join(bytes(item["protected_sample"]) for item in samples))
+
+    def test_genetec_profile_metadata_is_allowlisted_and_control_chars_removed(self):
+        safe = face._safe_genetec_profile_metadata({
+            "firstName": "Ada\nAdmin", "lastName": "Lovelace", "externalId": "STF-101",
+            "cardholderGroups": ["Faculty", "Faculty", "Ops\tTeam"],
+            "email": "not-needed@example.test", "secret": "do-not-store",
+        })
+        self.assertEqual(safe["firstName"], "AdaAdmin")
+        self.assertEqual(safe["cardholderGroups"], ["Faculty", "OpsTeam"])
+        self.assertNotIn("email", safe)
+        self.assertNotIn("secret", safe)
 
     def test_genetec_cardholder_cannot_be_linked_to_two_student_profiles(self):
         response, payload, _ = self._genetec_photo_payload()
@@ -306,11 +325,100 @@ class FaceAttendanceTests(unittest.TestCase):
         with patch("service.face_attendance._genetec_bridge_get", return_value=response):
             self.store.enroll_from_genetec(payload)
         candidate = self.store.match_student({"eventType": "CheckIn", "sessionId": "ATT-GENETEC-01", "imageData": "person-frame"})
+        self.assertEqual(candidate["candidate"]["firstName"], "Test")
+        self.assertEqual(candidate["candidate"]["externalId"], "S201")
+        self.assertEqual(candidate["candidate"]["cardholderGroups"], ["Stamford Test Group", "Faculty"])
         result = self.store.confirm_student({"ticketId": candidate["ticketId"], "studentId": "S201", "sessionId": "ATT-GENETEC-01", "operator": "Approved Operator", "confirmMatch": True})
         event = self.store.list_events("ATT-GENETEC-01")["events"][0]
         self.assertEqual(result["eventType"], "CheckIn")
         self.assertEqual(event["genetec_cardholder_guid"], payload["cardholderGuid"])
         self.assertEqual(event["genetecCredentialReferences"][0]["maskedIdentifier"], "••••5678")
+
+
+    def test_kiosk_mock_returns_distinct_synthetic_profiles_by_person_type(self):
+        image = "data:image/jpeg;base64,aGVsbG8="
+        for person_type, expected_name, expected_id in [
+            ("Student", "Ava Thompson", "STU-DEMO-10482"),
+            ("Staff", "James Carter", "STF-DEMO-02047"),
+            ("Contractor", "Morgan Lee", "CTR-DEMO-00301"),
+        ]:
+            result = self.store.match_kiosk_face({
+                "imageData": image, "personType": person_type,
+                "eventType": "CheckIn", "sessionId": "ATT-KIOSK-TEST",
+            })
+            self.assertEqual(result["mode"], "mock")
+            self.assertTrue(result["simulated"])
+            self.assertTrue(result["matched"])
+            self.assertEqual(result["candidate"]["personType"], person_type)
+            self.assertEqual(result["candidate"]["displayName"], expected_name)
+            self.assertEqual(result["candidate"]["studentId"], expected_id)
+            self.assertFalse(result["rawImagePersisted"])
+            self.assertTrue(result["humanConfirmationRequired"])
+
+    def test_kiosk_mock_requires_confirmation_and_records_local_only(self):
+        result = self.store.match_kiosk_face({
+            "imageData": "data:image/jpeg;base64,aGVsbG8=", "personType": "Staff",
+            "eventType": "CheckIn", "sessionId": "ATT-KIOSK-LOCAL",
+        })
+        with self.assertRaises(FaceAttendanceError) as context:
+            self.store.confirm_kiosk_face({
+                "ticketId": result["ticketId"], "studentId": result["candidate"]["studentId"],
+                "sessionId": "ATT-KIOSK-LOCAL", "confirmMatch": False,
+            })
+        self.assertEqual(context.exception.code, "HUMAN_CONFIRMATION_REQUIRED")
+        confirmed = self.store.confirm_kiosk_face({
+            "ticketId": result["ticketId"], "studentId": result["candidate"]["studentId"],
+            "sessionId": "ATT-KIOSK-LOCAL", "confirmMatch": True,
+        })
+        self.assertTrue(confirmed["simulated"])
+        self.assertFalse(confirmed["writtenToGenetec"])
+        self.assertEqual(confirmed["personType"], "Staff")
+        events = self.store.list_kiosk_events("ATT-KIOSK-LOCAL")
+        self.assertEqual(events["count"], 1)
+        self.assertTrue(events["events"][0]["simulated"])
+        with self.assertRaises(FaceAttendanceError) as context:
+            self.store.confirm_kiosk_face({
+                "ticketId": result["ticketId"], "studentId": result["candidate"]["studentId"],
+                "sessionId": "ATT-KIOSK-LOCAL", "confirmMatch": True,
+            })
+        self.assertEqual(context.exception.code, "MATCH_TICKET_ALREADY_USED")
+
+    def test_kiosk_checkout_requires_a_prior_checkin(self):
+        payload = {
+            "imageData": "data:image/jpeg;base64,aGVsbG8=", "personType": "Contractor",
+            "eventType": "CheckOut", "sessionId": "ATT-KIOSK-CHECKOUT",
+        }
+        result = self.store.match_kiosk_face(payload)
+        with self.assertRaises(FaceAttendanceError) as context:
+            self.store.confirm_kiosk_face({
+                "ticketId": result["ticketId"], "studentId": result["candidate"]["studentId"],
+                "sessionId": "ATT-KIOSK-CHECKOUT", "confirmMatch": True,
+            })
+        self.assertEqual(context.exception.code, "CHECKIN_REQUIRED")
+
+    def test_live_kiosk_selection_fails_closed_instead_of_falling_back_to_mock(self):
+        payload = {
+            "imageData": "data:image/jpeg;base64,aGVsbG8=", "personType": "Student",
+            "eventType": "CheckIn", "sessionId": "ATT-KIOSK-LIVE-GATED",
+        }
+        with patch.dict(os.environ, {"STAMFORD_KIOSK_FACE_MODE": "live", "STAMFORD_GENETEC_CARDHOLDER_FACE_SYNC_APPROVED": "0"}, clear=False):
+            with self.assertRaises(FaceAttendanceError) as context:
+                self.store.match_kiosk_face(payload)
+        self.assertEqual(context.exception.code, "GENETEC_CARDHOLDER_FACE_SYNC_DISABLED")
+
+    def test_enrollment_and_matching_are_scoped_to_staff_person_type(self):
+        staff_payload = self.payload("STAFF-200")
+        staff_payload.update({"personType": "Staff", "guardianConsent": False, "consentConfirmed": True})
+        enrolled = self.store.enroll(staff_payload)
+        self.assertEqual(enrolled["personType"], "Staff")
+        listed = self.store.list_students()["students"]
+        self.assertEqual(next(item["personType"] for item in listed if item["studentId"] == "STAFF-200"), "Staff")
+        match = self.store.match_student({
+            "personType": "Staff", "eventType": "CheckIn", "sessionId": "ATT-STAFF-ONLY", "imageData": "staff-frame",
+        })
+        self.assertTrue(match["matched"])
+        self.assertEqual(match["candidate"]["personType"], "Staff")
+        self.assertEqual(match["candidate"]["studentId"], "STAFF-200")
 
 
 if __name__ == "__main__":

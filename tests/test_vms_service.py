@@ -51,7 +51,7 @@ class VmsServiceTests(unittest.TestCase):
         self.assertTrue(body["boundToLoopback"])
         self.assertEqual(body["authentication"], "not-configured")
         self.assertEqual(body["mode"], "prototype-only")
-        self.assertEqual(body["build"], "5.2.1")
+        self.assertEqual(body["build"], "5.2.4")
 
     def test_face_attendance_feature_is_gated_by_default(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -104,6 +104,51 @@ class VmsServiceTests(unittest.TestCase):
             self.assertIn("Test UI", response.read().decode("utf-8"))
             self.assertIn("no-store", response.headers.get("Cache-Control", ""))
             self.assertEqual(response.headers.get("Pragma"), "no-cache")
+
+
+    def test_kiosk_face_status_defaults_to_explicit_mock_mode(self):
+        with patch.dict(os.environ, {}, clear=True):
+            code, body = self.request("GET", "/api/v1/kiosk-face/status")
+        self.assertEqual(code, 200)
+        self.assertEqual(body["mode"], "mock")
+        self.assertTrue(body["mockAvailable"])
+        self.assertFalse(body["liveReady"])
+        self.assertIn("approved profiles", body["liveGalleryBoundary"])
+
+    def test_kiosk_face_mock_api_records_only_after_explicit_confirmation(self):
+        with patch.dict(os.environ, {"STAMFORD_KIOSK_FACE_MODE": "mock"}, clear=True):
+            code, match = self.request("POST", "/api/v1/kiosk-face/match", {
+                "imageData": "data:image/jpeg;base64,aGVsbG8=", "personType": "Contractor",
+                "eventType": "CheckIn", "sessionId": "ATT-HTTP-KIOSK",
+            })
+            self.assertEqual(code, 200)
+            self.assertTrue(match["simulated"])
+            self.assertEqual(match["candidate"]["personType"], "Contractor")
+            code, denied = self.request("POST", "/api/v1/kiosk-face/confirm", {
+                "ticketId": match["ticketId"], "sessionId": "ATT-HTTP-KIOSK", "confirmMatch": False,
+            })
+            self.assertEqual(code, 400)
+            self.assertEqual(denied["error"], "HUMAN_CONFIRMATION_REQUIRED")
+            code, result = self.request("POST", "/api/v1/kiosk-face/confirm", {
+                "ticketId": match["ticketId"], "sessionId": "ATT-HTTP-KIOSK", "confirmMatch": True,
+            })
+            self.assertEqual(code, 201)
+            self.assertTrue(result["simulated"])
+            self.assertFalse(result["writtenToGenetec"])
+            code, events = self.request("GET", "/api/v1/kiosk-face/events?sessionId=ATT-HTTP-KIOSK")
+            self.assertEqual(code, 200)
+            self.assertEqual(events["count"], 1)
+            self.assertEqual(events["events"][0]["personType"], "Contractor")
+
+    def test_kiosk_live_api_does_not_silently_use_mock_when_gate_closed(self):
+        with patch.dict(os.environ, {"STAMFORD_KIOSK_FACE_MODE": "live"}, clear=True):
+            code, result = self.request("POST", "/api/v1/kiosk-face/match", {
+                "imageData": "data:image/jpeg;base64,aGVsbG8=", "personType": "Student",
+                "eventType": "CheckIn", "sessionId": "ATT-HTTP-LIVE-GATE",
+            })
+        self.assertEqual(code, 403)
+        self.assertEqual(result["error"], "FACE_ATTENDANCE_DISABLED")
+        self.assertNotIn("simulated", result)
 
 
 if __name__ == "__main__":

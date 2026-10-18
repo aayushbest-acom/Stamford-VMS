@@ -1,6 +1,17 @@
 # Stamford VMS prototype progress
 
-Updated: 2026-10-16
+Updated: 2026-10-18
+
+## Latest milestone — 5.2.4 kiosk face-attendance workflow
+
+- Added a kiosk option for Student, Staff and Contractor; webcam capture; mock/live indicator; candidate details and explicit confirmation; and a session-local attendance ledger.
+- Mock mode uses scripted synthetic records only and never stores the webcam frame or writes to Genetec. Check Out requires a prior Check In in the same session; duplicate events are rejected.
+- Live local matching remains gated and scoped to active, individually approved profiles linked to Genetec portraits and additional local camera samples. It is not a direct search over every Genetec Cardholder picture. The existing experimental LBPH matcher is not production-validated.
+- Enriched selected-Cardholder metadata with first/last name, External ID and Cardholder Group names where the installed SDK exposes them; masked credential references only.
+- Added `docs/CHANGE-REQUEST-KIOSK-FACE-ATTENDANCE.md`, `docs/KIOSK-FACE-ATTENDANCE.md` and `docs/VALIDATION-REPORT-MILESTONE5.2.4-KIOSK-FACE-ATTENDANCE.md`.
+- Current local validation: **90/90 Python tests pass**, Python compile checks and inline JavaScript syntax check pass. C# bridge build/live read-only profile query require the supported Windows/Genetec SDK host.
+- This adds a new biometric attendance purpose beyond the original SRS replacement-card workflow and needs formal safeguarding/privacy approval, category mapping, approved match accuracy/liveness thresholds, authentication/RBAC and a non-biometric fallback before real data is used.
+
 
 ## Current status
 
