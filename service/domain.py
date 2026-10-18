@@ -36,6 +36,22 @@ WINDOW_IGNORABLE = re.compile(r"[\u200b-\u200d\u2060\ufeff]")
 WINDOW_UNICODE_SPACE = re.compile(r"[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]")
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{40,64}$")
 EVENT_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
+VISITOR_TYPE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
+VISITOR_TYPE_SEEDS = (
+    ("parent-guardian", "Parent / Guardian", "Parent, guardian or authorised family contact", 10),
+    ("prospective-family", "Prospective Family", "Prospective student or family visit", 20),
+    ("contractor", "Contractor", "Approved contractor working on campus", 30),
+    ("vendor-supplier", "Vendor / Supplier", "Supplier or business representative", 40),
+    ("delivery-courier", "Delivery / Courier", "Parcel, food or goods delivery", 50),
+    ("service-provider", "Service Provider", "Maintenance, cleaning or other service visit", 60),
+    ("event-guest", "Event Guest", "Guest attending a school event", 70),
+    ("volunteer", "Volunteer", "Approved school volunteer", 80),
+    ("alumni", "Alumni", "Former student or alumni visit", 90),
+    ("staff-employee", "Staff / Employee", "Staff member attending as a visitor", 100),
+    ("student", "Student", "Student visit recorded through the visitor invitation workflow", 110),
+    ("general-visitor", "General Visitor", "General visitor when no more specific type applies", 120),
+    ("other", "Other", "Other visitor category", 130),
+)
 
 
 class DomainError(Exception):
@@ -131,7 +147,9 @@ class DomainStore:
                     checked_in_at_utc TEXT,
                     checked_out_at_utc TEXT,
                     revoked_at_utc TEXT,
-                    row_version INTEGER NOT NULL DEFAULT 1
+                    row_version INTEGER NOT NULL DEFAULT 1,
+                    visitor_type_id TEXT NOT NULL DEFAULT 'general-visitor',
+                    visitor_type_name TEXT NOT NULL DEFAULT 'General Visitor'
                 );
                 CREATE TABLE IF NOT EXISTS domain_events (
                     event_id TEXT PRIMARY KEY,
@@ -152,7 +170,32 @@ class DomainStore:
                     outcome TEXT NOT NULL,
                     detail_json TEXT NOT NULL DEFAULT '{}'
                 );
+                CREATE TABLE IF NOT EXISTS domain_visitor_types (
+                    visitor_type_id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    description TEXT NOT NULL DEFAULT '',
+                    is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+                    is_builtin INTEGER NOT NULL DEFAULT 0 CHECK(is_builtin IN (0,1)),
+                    sort_order INTEGER NOT NULL DEFAULT 1000,
+                    created_at_utc TEXT NOT NULL,
+                    updated_at_utc TEXT NOT NULL
+                );
             """)
+            # Upgrade databases created before visitor types were introduced.
+            # Keep current visit state and QR hashes unchanged during migration.
+            visit_columns = {row["name"] for row in conn.execute("PRAGMA table_info(domain_visits)").fetchall()}
+            if "visitor_type_id" not in visit_columns:
+                conn.execute("ALTER TABLE domain_visits ADD COLUMN visitor_type_id TEXT NOT NULL DEFAULT 'general-visitor'")
+            if "visitor_type_name" not in visit_columns:
+                conn.execute("ALTER TABLE domain_visits ADD COLUMN visitor_type_name TEXT NOT NULL DEFAULT 'General Visitor'")
+            stamp = iso_utc()
+            for type_id, name, description, sort_order in VISITOR_TYPE_SEEDS:
+                conn.execute(
+                    """INSERT OR IGNORE INTO domain_visitor_types(
+                        visitor_type_id,display_name,description,is_active,is_builtin,sort_order,created_at_utc,updated_at_utc)
+                        VALUES(?,?,?,?,?,?,?,?)""",
+                    (type_id, name, description, 1, 1, sort_order, stamp, stamp),
+                )
 
     def _audit(self, conn: sqlite3.Connection, action: str, booking_id: str | None, outcome: str, details: dict | None = None) -> None:
         conn.execute(
@@ -178,6 +221,8 @@ class DomainStore:
             "host": row["host_name"],
             "destination": row["destination"],
             "purpose": row["purpose"],
+            "visitorTypeId": row["visitor_type_id"],
+            "visitorType": row["visitor_type_name"],
             "visitDate": row["visit_date"],
             "window": row["visit_window"],
             "status": row["status"],
@@ -189,6 +234,116 @@ class DomainStore:
             "securePass": True,
             "rowVersion": row["row_version"],
         }
+
+    @staticmethod
+    def _clean_type_text(value: object, field: str, maximum: int, *, required: bool) -> str:
+        if value is None and not required:
+            return ""
+        if not isinstance(value, str):
+            raise DomainError(400, "INVALID_VISITOR_TYPE_FIELD", f"Field '{field}' must be text.")
+        normalized = unicodedata.normalize("NFKC", value)
+        if any(unicodedata.category(ch).startswith("C") for ch in normalized):
+            raise DomainError(400, "INVALID_VISITOR_TYPE_FIELD", f"Field '{field}' contains unsupported control characters.")
+        cleaned = " ".join(normalized.split())
+        if required and not cleaned:
+            raise DomainError(400, "INVALID_VISITOR_TYPE_FIELD", f"Field '{field}' is required.")
+        if len(cleaned) > maximum:
+            raise DomainError(400, "INVALID_VISITOR_TYPE_FIELD", f"Field '{field}' must be at most {maximum} characters.")
+        if required and len(cleaned) < 2:
+            raise DomainError(400, "INVALID_VISITOR_TYPE_FIELD", f"Field '{field}' must contain at least 2 characters.")
+        return cleaned
+
+    @staticmethod
+    def _public_visitor_type(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["visitor_type_id"],
+            "name": row["display_name"],
+            "description": row["description"],
+            "isActive": bool(row["is_active"]),
+            "isBuiltIn": bool(row["is_builtin"]),
+            "createdAtUtc": row["created_at_utc"],
+            "updatedAtUtc": row["updated_at_utc"],
+        }
+
+    def list_visitor_types(self, include_inactive: bool = True) -> dict:
+        where = "" if include_inactive else "WHERE is_active=1"
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"SELECT * FROM domain_visitor_types {where} ORDER BY sort_order, display_name COLLATE NOCASE"
+            ).fetchall()
+        return {
+            "ok": True,
+            "visitorTypes": [self._public_visitor_type(row) for row in rows],
+            "source": "transactional-local-domain-store",
+            "persistence": "sqlite-local",
+        }
+
+    def create_visitor_type(self, payload: object) -> dict:
+        if not isinstance(payload, dict):
+            raise DomainError(400, "INVALID_REQUEST", "Request body must be a JSON object.")
+        name = self._clean_type_text(payload.get("name"), "name", 64, required=True)
+        description = self._clean_type_text(payload.get("description", ""), "description", 160, required=False)
+        stamp = iso_utc()
+        type_id = "custom-" + secrets.token_hex(8)
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """INSERT INTO domain_visitor_types(
+                        visitor_type_id,display_name,description,is_active,is_builtin,sort_order,created_at_utc,updated_at_utc)
+                        VALUES(?,?,?,?,?,?,?,?)""",
+                    (type_id, name, description, 1, 0, 1000, stamp, stamp),
+                )
+                self._audit(conn, "VisitorTypeCreated", None, "Success", {"visitorTypeId": type_id, "name": name})
+                conn.execute("COMMIT")
+            except sqlite3.IntegrityError as exc:
+                conn.execute("ROLLBACK")
+                raise DomainError(409, "VISITOR_TYPE_NAME_EXISTS", "A visitor type with that name already exists.") from exc
+        return {"ok": True, "visitorType": self.get_visitor_type(type_id)}
+
+    def get_visitor_type(self, type_id: str) -> dict | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT * FROM domain_visitor_types WHERE visitor_type_id=?", (type_id,)).fetchone()
+        return self._public_visitor_type(row) if row else None
+
+    def update_visitor_type(self, type_id: str, payload: object) -> dict:
+        if not VISITOR_TYPE_ID_RE.fullmatch(type_id):
+            raise DomainError(400, "INVALID_VISITOR_TYPE_ID", "Visitor type ID is invalid.")
+        if not isinstance(payload, dict):
+            raise DomainError(400, "INVALID_REQUEST", "Request body must be a JSON object.")
+        if not any(key in payload for key in ("name", "description", "isActive")):
+            raise DomainError(400, "EMPTY_VISITOR_TYPE_UPDATE", "Provide a name, description or isActive value to update.")
+        stamp = iso_utc()
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM domain_visitor_types WHERE visitor_type_id=?", (type_id,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise DomainError(404, "VISITOR_TYPE_NOT_FOUND", "That visitor type does not exist.")
+            name = self._clean_type_text(payload.get("name", row["display_name"]), "name", 64, required=True)
+            description = self._clean_type_text(payload.get("description", row["description"]), "description", 160, required=False)
+            is_active = row["is_active"]
+            if "isActive" in payload:
+                if type(payload["isActive"]) is not bool:
+                    conn.execute("ROLLBACK")
+                    raise DomainError(400, "INVALID_VISITOR_TYPE_STATUS", "isActive must be true or false.")
+                is_active = int(payload["isActive"])
+            if row["is_active"] and not is_active:
+                active_count = conn.execute("SELECT COUNT(*) FROM domain_visitor_types WHERE is_active=1").fetchone()[0]
+                if active_count <= 1:
+                    conn.execute("ROLLBACK")
+                    raise DomainError(409, "LAST_ACTIVE_VISITOR_TYPE", "At least one visitor type must remain active.")
+            try:
+                conn.execute(
+                    "UPDATE domain_visitor_types SET display_name=?,description=?,is_active=?,updated_at_utc=? WHERE visitor_type_id=?",
+                    (name, description, is_active, stamp, type_id),
+                )
+                self._audit(conn, "VisitorTypeUpdated", None, "Success", {"visitorTypeId": type_id, "isActive": bool(is_active), "name": name})
+                conn.execute("COMMIT")
+            except sqlite3.IntegrityError as exc:
+                conn.execute("ROLLBACK")
+                raise DomainError(409, "VISITOR_TYPE_NAME_EXISTS", "A visitor type with that name already exists.") from exc
+        return {"ok": True, "visitorType": self.get_visitor_type(type_id)}
 
     def list_visits(self) -> list[dict]:
         with closing(self._connect()) as conn:
@@ -211,6 +366,7 @@ class DomainStore:
         visit_window = payload.get("window")
         email = payload.get("email", "")
         purpose = payload.get("purpose", payload.get("note", ""))
+        visitor_type_id = payload.get("visitorTypeId", "general-visitor")
         for field, value, maximum in (("id", booking_id, 83), ("name", name, 90), ("host", host, 90), ("destination", destination, 120), ("visitDate", visit_date, 10), ("window", visit_window, 32), ("email", email, 120), ("purpose", purpose, 200)):
             if not isinstance(value, str) or not value.strip() or len(value.strip()) > maximum:
                 if field in {"email", "purpose"} and (value is None or value == ""):
@@ -219,6 +375,9 @@ class DomainStore:
         booking_id = booking_id.strip().upper()
         if not BOOKING_RE.fullmatch(booking_id):
             raise DomainError(400, "INVALID_BOOKING_ID", "Booking ID must start with VMS- and contain only letters, digits and hyphens.")
+        if not isinstance(visitor_type_id, str) or not VISITOR_TYPE_ID_RE.fullmatch(visitor_type_id.strip().lower()):
+            raise DomainError(400, "INVALID_VISITOR_TYPE_ID", "Select a valid visitor type from the active visitor-type list.")
+        visitor_type_id = visitor_type_id.strip().lower()
         try:
             parsed_date = date.fromisoformat(visit_date)
         except ValueError as exc:
@@ -236,13 +395,25 @@ class DomainStore:
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                visitor_type = conn.execute(
+                    "SELECT display_name FROM domain_visitor_types WHERE visitor_type_id=? AND is_active=1",
+                    (visitor_type_id,),
+                ).fetchone()
+                if visitor_type is None:
+                    conn.execute("ROLLBACK")
+                    raise DomainError(400, "VISITOR_TYPE_INACTIVE_OR_UNKNOWN", "The selected visitor type is unknown or inactive. Refresh the visitor-type list and choose an active type.")
+                visitor_type_name = visitor_type["display_name"]
                 conn.execute("""INSERT INTO domain_visits(
                     booking_id,visitor_name,visitor_email,host_name,destination,purpose,visit_date,visit_window,status,
-                    qr_token_hash,qr_expires_at_utc,created_at_utc,updated_at_utc)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (booking_id, name.strip(), email.strip() if isinstance(email, str) else "", host.strip(), destination.strip(), purpose.strip() if isinstance(purpose, str) else "", visit_date, visit_window.strip(), "Invited", token_digest(token), iso_utc(expires), stamp, stamp))
-                self._audit(conn, "InvitationCreated", booking_id, "Success", {"state": "Invited", "token": "hashed-only"})
+                    qr_token_hash,qr_expires_at_utc,created_at_utc,updated_at_utc,visitor_type_id,visitor_type_name)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (booking_id, name.strip(), email.strip() if isinstance(email, str) else "", host.strip(), destination.strip(), purpose.strip() if isinstance(purpose, str) else "", visit_date, visit_window.strip(), "Invited", token_digest(token), iso_utc(expires), stamp, stamp, visitor_type_id, visitor_type_name))
+                self._audit(conn, "InvitationCreated", booking_id, "Success", {"state": "Invited", "token": "hashed-only", "visitorTypeId": visitor_type_id, "visitorType": visitor_type_name})
                 conn.execute("COMMIT")
+            except DomainError:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
             except sqlite3.IntegrityError as exc:
                 conn.execute("ROLLBACK")
                 raise DomainError(409, "BOOKING_ID_EXISTS", "That booking ID already exists. Retrieve the booking or rotate its QR pass instead of creating a duplicate.") from exc

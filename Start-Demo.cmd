@@ -1,8 +1,8 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-echo Starting Stamford VMS prototype - BUILD 5.2.4
-echo UI updates: explicit visit start/end times, laptop-camera QR scanner, no Day 1/Day 2 banner.
+echo Starting Stamford VMS prototype - BUILD 5.4.0
+echo UI includes visitor/group workflows, attendance kiosk, visitor types, reports and CSV/XLSX/JSON/PDF/HTML exports.
 echo URL: http://127.0.0.1:8080
 echo Persistence: local SQLite service with browser fallback.
 echo QR scanner: browser native detection or local OpenCV frame decoder.
@@ -37,7 +37,7 @@ goto LAUNCH_END
 
 :PORT_IN_USE
 echo ERROR: Port 8080 is already in use. A previous VMS instance is likely still running.
-echo Close the old VMS console, then launch Start-Demo.cmd from this Milestone 5.2.4 folder.
+echo Close the old VMS console, then launch Start-Demo.cmd from this Milestone 5.4.0 folder.
 echo The launcher stopped here so the older UI cannot silently appear to be the updated build.
 timeout /t 15 /nobreak >nul
 exit /b 2

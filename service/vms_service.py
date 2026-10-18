@@ -41,6 +41,16 @@ try:
 except ImportError:  # direct script execution
     from integrations import IntegrationError, IntegrationHub
 
+try:
+    from .group_visits import GroupVisitError, GroupVisitStore
+except ImportError:  # direct script execution
+    from group_visits import GroupVisitError, GroupVisitStore
+
+try:
+    from .reporting import ReportingError, ReportService
+except ImportError:  # direct script execution
+    from reporting import ReportingError, ReportService
+
 MAX_BODY_BYTES = 4 * 1024 * 1024
 SCHEMA_VERSION = 1
 STATE_LIMITS = {
@@ -150,14 +160,16 @@ def validate_snapshot(payload: object) -> tuple[int, dict]:
     return revision, normalized
 
 
-def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | None = None, face_store: FaceAttendanceStore | None = None, integration_hub: IntegrationHub | None = None):
+def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | None = None, face_store: FaceAttendanceStore | None = None, integration_hub: IntegrationHub | None = None, group_store: GroupVisitStore | None = None):
     ui_dir = ui_dir.resolve()
     domain_store = domain_store or DomainStore(store.db_path)
     face_store = face_store or FaceAttendanceStore(store.db_path.with_name("face-attendance.sqlite3"))
+    group_store = group_store or GroupVisitStore(face_store.db_path)
     integration_hub = integration_hub or IntegrationHub(store.db_path)
+    report_service = ReportService(store.db_path, face_store.db_path)
 
     class Handler(SimpleHTTPRequestHandler):
-        server_version = "StamfordVMSPrototype/5.2.4"
+        server_version = "StamfordVMSPrototype/5.4.0"
         sys_version = ""
 
         def __init__(self, *args, **kwargs):
@@ -175,6 +187,18 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(raw)
+
+        def _send_download(self, code: int, content_type: str, filename: str, payload: bytes):
+            # Only generated, server-controlled filenames are passed here.
+            safe_filename = re.sub(r"[^A-Za-z0-9._-]", "-", filename)[:180] or "stamford-vms-report.bin"
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Content-Disposition", f'attachment; filename="{safe_filename}"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(payload)
 
         def _send_svg(self, code: int, payload: bytes):
             self.send_response(code)
@@ -204,6 +228,11 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
             self._send_json(exc.status, payload)
 
         def _send_face_error(self, exc: FaceAttendanceError):
+            payload = {"ok": False, "error": exc.code, "message": exc.message}
+            payload.update(exc.extra)
+            self._send_json(exc.status, payload)
+
+        def _send_group_error(self, exc: GroupVisitError):
             payload = {"ok": False, "error": exc.code, "message": exc.message}
             payload.update(exc.extra)
             self._send_json(exc.status, payload)
@@ -242,7 +271,7 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
                 return
             path = urlsplit(self.path).path
             if path == "/api/v1/health":
-                self._send_json(200, {"ok": True, "service": "Stamford VMS local prototype service", "build": "5.2.4", "schoolTimeZone": "Asia/Singapore", "mode": "prototype-only", "persistence": "sqlite-local", "authentication": "not-configured", "boundToLoopback": True})
+                self._send_json(200, {"ok": True, "service": "Stamford VMS local prototype service", "build": "5.4.0", "schoolTimeZone": "Asia/Singapore", "mode": "prototype-only", "persistence": "sqlite-local", "authentication": "not-configured", "boundToLoopback": True})
                 return
             if path == "/api/v1/integrations/status":
                 try:
@@ -258,12 +287,24 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
                     logging.exception("Unable to read SMS outbox")
                     self._send_json(500, {"ok": False, "error": "SMS_OUTBOX_FAILED", "message": "The local SMS outbox could not be read."})
                 return
+            if path == "/api/v1/reports/catalog":
+                self._send_json(200, report_service.catalog())
+                return
             if path == "/api/v1/state":
                 try:
                     self._send_json(200, store.load())
                 except Exception:
                     logging.exception("Unable to load prototype state")
                     self._send_json(500, {"ok": False, "error": "STATE_LOAD_FAILED", "message": "Saved state could not be loaded. Stop and preserve the local database for investigation."})
+                return
+            if path == "/api/v1/visitor-types":
+                try:
+                    query = parse_qs(urlsplit(self.path).query)
+                    include_inactive = (query.get("includeInactive") or ["1"])[0].strip().lower() in {"1", "true", "yes"}
+                    self._send_json(200, domain_store.list_visitor_types(include_inactive=include_inactive))
+                except Exception:
+                    logging.exception("Unable to list visitor types")
+                    self._send_json(500, {"ok": False, "error": "VISITOR_TYPE_LIST_FAILED", "message": "Visitor types could not be loaded from local SQLite."})
                 return
             if path == "/api/v1/visits":
                 try:
@@ -283,6 +324,32 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
                 except Exception:
                     logging.exception("Unable to read domain visit")
                     self._send_json(500, {"ok": False, "error": "VISIT_READ_FAILED", "message": "Domain visit could not be loaded."})
+                return
+            if path == "/api/v1/group-visits/status":
+                try:
+                    self._send_json(200, group_store.status())
+                except Exception:
+                    logging.exception("Unable to inspect group-visit feature status")
+                    self._send_json(500, {"ok": False, "error": "GROUP_VISIT_STATUS_FAILED", "message": "Group-visit status could not be read."})
+                return
+            if path == "/api/v1/group-visits":
+                try:
+                    self._send_json(200, group_store.list_bookings())
+                except GroupVisitError as exc:
+                    self._send_group_error(exc)
+                except Exception:
+                    logging.exception("Unable to list group visits")
+                    self._send_json(500, {"ok": False, "error": "GROUP_VISIT_LIST_FAILED", "message": "Group visits could not be loaded."})
+                return
+            group_path = re.fullmatch(r"/api/v1/group-visits/([^/]+)", path)
+            if group_path:
+                try:
+                    self._send_json(200, {"ok": True, "group": group_store.get_booking(unquote(group_path.group(1)))})
+                except GroupVisitError as exc:
+                    self._send_group_error(exc)
+                except Exception:
+                    logging.exception("Unable to read group visit")
+                    self._send_json(500, {"ok": False, "error": "GROUP_VISIT_READ_FAILED", "message": "The requested group visit could not be loaded."})
                 return
             if path == "/api/v1/face-attendance/status":
                 try:
@@ -431,9 +498,102 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
                 return
 
             try:
+                if path == "/api/v1/reports/preview":
+                    self._send_json(200, report_service.preview(payload))
+                    return
+                if path == "/api/v1/reports/export":
+                    filename, content_type, body, meta = report_service.export(payload)
+                    self._send_download(200, content_type, filename, body)
+                    return
                 if path == "/api/v1/integrations/sms/send":
                     result = integration_hub.send_sms(payload)
                     self._send_json(200 if result.get("alreadyApplied") else 201, result)
+                    return
+                if path == "/api/v1/visitor-types":
+                    result = domain_store.create_visitor_type(payload)
+                    self._send_json(201, result)
+                    return
+                visitor_type_update_match = re.fullmatch(r"/api/v1/visitor-types/([a-z0-9-]+)/update", path, re.I)
+                if visitor_type_update_match:
+                    type_id = visitor_type_update_match.group(1).lower()
+                    result = domain_store.update_visitor_type(type_id, payload)
+                    self._send_json(200, result)
+                    return
+                if path == "/api/v1/group-visits":
+                    group = group_store.create_booking(payload)
+                    self._send_json(201, {"ok": True, "group": group})
+                    return
+                if path == "/api/v1/group-visits/qr/validate":
+                    token = payload.get("groupQrToken") if isinstance(payload, dict) else None
+                    self._send_json(200, group_store.validate_qr(token))
+                    return
+                if path == "/api/v1/group-visits/qr/svg":
+                    token = payload.get("groupQrToken") if isinstance(payload, dict) else None
+                    self._send_svg(200, group_store.qr_svg(token))
+                    return
+                group_qr_rotate_match = re.fullmatch(r"/api/v1/group-visits/([^/]+)/qr/rotate", path)
+                if group_qr_rotate_match:
+                    self._send_json(200, group_store.rotate_qr(unquote(group_qr_rotate_match.group(1))))
+                    return
+                group_roster_match = re.fullmatch(r"/api/v1/group-visits/([^/]+)/roster", path)
+                if group_roster_match:
+                    group = group_store.add_roster(unquote(group_roster_match.group(1)), payload)
+                    self._send_json(200, {"ok": True, "group": group})
+                    return
+                group_scan_match = re.fullmatch(r"/api/v1/group-visits/([^/]+)/scan", path)
+                if group_scan_match:
+                    group_id = unquote(group_scan_match.group(1)).upper()
+                    mode = group_store.status()["mode"]
+                    scan_meta = group_store.create_scan(group_id, payload, mode=mode)
+                    if mode == "mock":
+                        match_result = group_store.mock_match_result(group_id, scan_meta, payload["imageWidth"], payload["imageHeight"])
+                    else:
+                        booking = group_store.get_booking(group_id)
+                        approved_profile_ids = [member["faceProfileId"] for member in booking["roster"] if member.get("faceProfileId")]
+                        if not approved_profile_ids:
+                            match_result = {"ok": True, "mode": "live", "simulated": False, "matchingAvailable": False, "errorCode": "NO_APPROVED_ROSTER_PROFILES", "message": "Photo captured. No roster member has an active approved face profile; use the manual roster reconciliation workflow. No identity was inferred.", "groupEventId": group_id, "scanId": scan_meta["scanId"], "eventType": payload.get("eventType"), "detectedFaceCount": 0, "imageWidth": payload["imageWidth"], "imageHeight": payload["imageHeight"], "candidates": [], "groupImageUsedForEnrollment": False, "humanRosterReconciliationRequired": True}
+                        else:
+                            try:
+                                match_result = face_store.match_group({"imageData": payload.get("imageData"), "eventType": payload.get("eventType"), "groupEventId": group_id, "sessionId": group_id, "studentIds": approved_profile_ids})
+                                member_by_profile = {member["faceProfileId"]: member for member in booking["roster"] if member.get("faceProfileId")}
+                                for candidate in match_result.get("candidates", []):
+                                    profile = candidate.get("candidate", {}) if isinstance(candidate, dict) else {}
+                                    matched_member = member_by_profile.get(profile.get("studentId"))
+                                    if matched_member:
+                                        candidate["memberId"] = matched_member["memberId"]
+                                match_result["mode"] = "live"
+                                match_result["simulated"] = False
+                                match_result["matchingAvailable"] = True
+                                match_result["scanId"] = scan_meta["scanId"]
+                                match_result["groupImageUsedForEnrollment"] = False
+                            except FaceAttendanceError as exc:
+                                # The photo remains available for human roster reconciliation, but there is no mock fallback in live mode.
+                                match_result = {"ok": True, "mode": "live", "simulated": False, "matchingAvailable": False, "errorCode": exc.code, "message": f"Group photo captured; live matching is unavailable ({exc.message}). Review the roster manually or correct the approval/device configuration and capture again.", "groupEventId": group_id, "scanId": scan_meta["scanId"], "eventType": payload.get("eventType"), "detectedFaceCount": 0, "imageWidth": payload["imageWidth"], "imageHeight": payload["imageHeight"], "candidates": [], "groupImageUsedForEnrollment": False, "humanRosterReconciliationRequired": True}
+                    match_result.update({"scanId": scan_meta["scanId"], "groupPhotoRetained": scan_meta["photoRetained"], "photoRetentionStatus": scan_meta["photoRetentionStatus"], "photoRetentionReason": scan_meta["photoRetentionReason"]})
+                    group_store.update_scan_match(scan_meta["scanId"], match_result)
+                    self._send_json(200, match_result)
+                    return
+                group_confirm_match = re.fullmatch(r"/api/v1/group-visits/([^/]+)/confirm", path)
+                if group_confirm_match:
+                    group_id = unquote(group_confirm_match.group(1)).upper()
+                    if not isinstance(payload, dict):
+                        raise GroupVisitError(400, "INVALID_CONFIRMATION", "Request body must be a JSON object.")
+                    mode = group_store.get_scan(group_id, str(payload.get("scanId", "")))["mode"]
+                    if mode == "mock":
+                        result = group_store.confirm_mock_scan(group_id, payload)
+                    else:
+                        decision = group_store.validate_live_confirmations(group_id, str(payload.get("scanId", "")), payload.get("eventType"), payload.get("confirmations"), payload.get("operator"))
+                        face_result = face_store.confirm_group_batch({"groupEventId": group_id, "sessionId": group_id, "operator": decision["operator"], "confirmBatch": True, "confirmations": decision["faceConfirmations"]})
+                        result = group_store.finalize_live_scan(group_id, payload, face_result)
+                        result["faceAttendanceEvents"] = face_result.get("events", [])
+                        result["genetecSyncQueuedCount"] = face_result.get("genetecSyncQueuedCount", 0)
+                        result["genetecEventRaisedCount"] = face_result.get("genetecEventRaisedCount", 0)
+                    self._send_json(201, result)
+                    return
+                group_reconcile_match = re.fullmatch(r"/api/v1/group-visits/([^/]+)/reconcile", path)
+                if group_reconcile_match:
+                    group = group_store.reconcile(unquote(group_reconcile_match.group(1)), payload)
+                    self._send_json(200, {"ok": True, "group": group})
                     return
                 if path == "/api/v1/visits":
                     result = domain_store.create_visit(payload)
@@ -499,6 +659,9 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
                 if path == "/api/v1/face-attendance/confirm":
                     self._send_json(200, face_store.confirm_student(payload))
                     return
+                if path == "/api/v1/face-attendance/genetec-sync/retry":
+                    self._send_json(200, face_store.retry_pending_genetec_attendance(payload))
+                    return
                 if path == "/api/v1/kiosk-face/match":
                     self._send_json(200, face_store.match_kiosk_face(payload))
                     return
@@ -512,10 +675,14 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
                     self._send_json(200, face_store.confirm_group_batch(payload))
                     return
                 self._send_json(404, {"ok": False, "error": "NOT_FOUND", "message": "No API route matches this request."})
+            except ReportingError as exc:
+                self._send_json(exc.status, {"ok": False, "error": exc.code, "message": exc.message})
             except DomainError as exc:
                 self._send_domain_error(exc)
             except FaceAttendanceError as exc:
                 self._send_face_error(exc)
+            except GroupVisitError as exc:
+                self._send_group_error(exc)
             except IntegrationError as exc:
                 payload = {"ok": False, "error": exc.code, "message": exc.message}
                 payload.update(exc.extra)
@@ -559,6 +726,8 @@ def main(argv=None) -> int:
         logging.info("Local SQLite database: %s", args.data_dir / "prototype-state.sqlite3")
         logging.info("Domain API routes: POST /api/v1/visits, POST /api/v1/qr/decode-frame, POST /api/v1/qr/validate, POST /api/v1/qr/check-in, POST /api/v1/qr/check-out, POST /api/v1/qr/svg")
         logging.info("Prototype adapters: GET /api/v1/integrations/status; GET /api/v1/integrations/sms/outbox; POST /api/v1/integrations/sms/send (mock by default; live provider is allow-list gated)")
+        logging.info("Reports API: GET /api/v1/reports/catalog; POST /api/v1/reports/preview|export (CSV, XLSX, JSON, PDF, HTML)")
+        logging.info("Group visit API: GET /api/v1/group-visits/status|/api/v1/group-visits; POST /api/v1/group-visits, /qr/validate|svg, /{groupId}/qr/rotate|roster|scan|confirm|reconcile")
         logging.info("Optional gated face attendance API: GET /api/v1/face-attendance/status; POST /api/v1/face-attendance/enroll|match|confirm|group-match|group-confirm-batch")
         logging.info("Approved local Genetec student roster API: GET /api/v1/genetec/student-roster/groups; POST /api/v1/genetec/student-roster/import; GET /api/v1/genetec/student-roster; GET /api/v1/genetec/student-roster/{guid}/portrait; POST /api/v1/genetec/student-roster/{guid}/attendance")
         logging.warning("PROTOTYPE ONLY: no enterprise authentication/authorization; use synthetic data only; do not expose beyond loopback")

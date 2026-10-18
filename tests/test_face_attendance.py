@@ -74,6 +74,8 @@ class FaceAttendanceTests(unittest.TestCase):
         self.gate_patch.start()
         self.extract_patch = patch("service.face_attendance._extract_faces", side_effect=self.fake_extract)
         self.extract_patch.start()
+        self.group_extract_patch = patch("service.face_attendance._extract_faces_with_boxes", side_effect=self.fake_extract_with_boxes)
+        self.group_extract_patch.start()
         self.cv_patch = patch("service.face_attendance._opencv_module", return_value=(_FakeCV(), _FakeNumpy()))
         self.cv_patch.start()
         self.decode_patch = patch("service.face_attendance._decode_crop", side_effect=lambda data: data)
@@ -81,7 +83,7 @@ class FaceAttendanceTests(unittest.TestCase):
         self._fake_counter = 0
 
     def tearDown(self):
-        for p in (self.decode_patch, self.cv_patch, self.extract_patch, self.gate_patch, self.feature_flags):
+        for p in (self.decode_patch, self.cv_patch, self.group_extract_patch, self.extract_patch, self.gate_patch, self.feature_flags):
             p.stop()
         self.temp.cleanup()
 
@@ -91,6 +93,11 @@ class FaceAttendanceTests(unittest.TestCase):
         if data_url == "group-enrollment-photo":
             raise FaceAttendanceError(422, "TOO_MANY_FACES", "multiple faces")
         return [b"individual-face-crop"]
+
+    def fake_extract_with_boxes(self, data_url, max_faces=40, group_workflow=False):
+        if data_url != "group-frame":
+            raise FaceAttendanceError(400, "INVALID_IMAGE", "unexpected fake group input")
+        return ([{"faceIndex": 1, "cropBytes": b"crop-a", "boundingBox": {"x": 10, "y": 20, "width": 40, "height": 40}}, {"faceIndex": 2, "cropBytes": b"crop-b", "boundingBox": {"x": 70, "y": 20, "width": 40, "height": 40}}], 640, 480)
 
     def payload(self, student_id):
         return {

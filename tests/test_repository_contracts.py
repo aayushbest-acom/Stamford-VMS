@@ -170,21 +170,60 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("function navigate(v){if(currentView==='kiosk'&&v!=='kiosk'){stopQrCamera(false);stopKioskFaceCamera(false);}", self.ui)
 
     def test_milestone_511_build_marker_and_stale_build_prevention(self):
-        self.assertIn('<title>Stamford VMS | Visitor Management System · UI 5.2.4</title>', self.ui)
+        self.assertIn('<title>Stamford VMS | Visitor Management System · UI 5.4.0</title>', self.ui)
         self.assertNotIn('UI 5.2.0', self.ui)
-        self.assertIn('meta name="vms-build" content="5.2.4"', self.ui)
-        self.assertIn('UI BUILD 5.2.4', self.ui)
-        self.assertIn("const VMS_BUILD='5.2.4'", self.ui)
+        self.assertIn('meta name="vms-build" content="5.4.0"', self.ui)
+        self.assertIn('UI BUILD 5.4.0', self.ui)
+        self.assertIn("const VMS_BUILD='5.4.0'", self.ui)
         self.assertNotIn('Planned visit window', self.ui)
         self.assertNotIn('A USB QR scanner that types into a field', self.ui)
         launcher = (ROOT / "Start-Demo.cmd").read_text(encoding="utf-8")
-        self.assertIn("BUILD 5.2.4", launcher)
+        self.assertIn("BUILD 5.4.0", launcher)
         self.assertIn("PORT_IN_USE", launcher)
         self.assertIn("previous VMS instance", launcher)
         service = (ROOT / "service" / "vms_service.py").read_text(encoding="utf-8")
-        self.assertIn('"build": "5.2.4"', service)
-        self.assertIn("StamfordVMSPrototype/5.2.4", service)
+        self.assertIn('"build": "5.4.0"', service)
+        self.assertIn("StamfordVMSPrototype/5.4.0", service)
         self.assertIn('Cache-Control", "no-store, no-cache, must-revalidate, max-age=0', service)
+
+
+    def test_stamford_logo_assets_are_used_in_frontend_and_print_flows(self):
+        self.assertIn('rel="icon" type="image/png" sizes="64x64" href="assets/stamford-school-crest.png"', self.ui)
+        self.assertIn('class="brand-logo" src="assets/stamford-school-logo.png"', self.ui)
+        self.assertGreaterEqual(self.ui.count('class="kiosk-brand-logo" src="assets/stamford-school-logo.png"'), 2)
+        self.assertIn('class="stamford-print-logo" src="assets/stamford-school-logo.png"', self.ui)
+        self.assertIn("new URL('assets/stamford-school-logo.png',window.location.href)", self.ui)
+        for asset in ("stamford-school-logo.png", "stamford-school-crest.png"):
+            path = ROOT / "ui" / "assets" / asset
+            self.assertTrue(path.is_file(), f"Missing Stamford branding asset: {asset}")
+            self.assertGreater(path.stat().st_size, 100, f"Branding asset is unexpectedly small: {asset}")
+
+    def test_visitor_type_catalogue_drives_invitation_form_and_is_server_persisted(self):
+        service = (ROOT / "service" / "vms_service.py").read_text(encoding="utf-8")
+        domain = (ROOT / "service" / "domain.py").read_text(encoding="utf-8")
+        self.assertIn('data-view="visitor-types"', self.ui)
+        self.assertIn('id="visitorTypeId"', self.ui)
+        self.assertIn("visitorTypeId})", self.ui)
+        self.assertIn("function activeVisitorTypeOptions()", self.ui)
+        self.assertIn("function createVisitorTypeFromForm(event)", self.ui)
+        self.assertIn("function setVisitorTypeActive(typeId,isActive)", self.ui)
+        self.assertIn('if path == "/api/v1/visitor-types":', service)
+        self.assertIn('r"/api/v1/visitor-types/([a-z0-9-]+)/update"', service)
+        self.assertIn("CREATE TABLE IF NOT EXISTS domain_visitor_types", domain)
+        self.assertIn("visitor_type_id TEXT NOT NULL DEFAULT 'general-visitor'", domain)
+        self.assertIn('"visitorTypeId": row["visitor_type_id"]', domain)
+        self.assertIn('"visitorType": row["visitor_type_name"]', domain)
+
+    def test_reporting_exports_are_wired_to_ui_and_service(self):
+        self.assertIn('data-view="reports"', self.ui)
+        self.assertIn('id="view-reports"', self.ui)
+        for endpoint in ("/api/v1/reports/catalog", "/api/v1/reports/preview", "/api/v1/reports/export"):
+            self.assertIn(endpoint, self.ui)
+            self.assertIn(endpoint, (ROOT / "service" / "vms_service.py").read_text(encoding="utf-8"))
+        reporting = (ROOT / "service" / "reporting.py").read_text(encoding="utf-8")
+        for report_id in ("visitor_register", "group_visit_register", "individual_attendance", "genetec_sync_status", "sms_delivery_log"):
+            self.assertIn(f'"id": "{report_id}"', reporting)
+        self.assertIn('SUPPORTED_FORMATS = ("csv", "xlsx", "json", "pdf", "html")', reporting)
 
     def test_checkout_recovery_requires_readback_verified_checkin_first(self):
         # If the VMS has already recorded local arrival and departure, render the
@@ -199,6 +238,20 @@ class RepositoryContractTests(unittest.TestCase):
         # Success rerenders the next event button (checkout); a finally block must
         # not accidentally disable it based on the just-completed check-in record.
         self.assertNotIn("retry.disabled=!(lastBridgeResponse.connected===true", self.ui)
+
+    def test_group_visit_workflow_is_booking_scoped_and_clears_ephemeral_photo_state(self):
+        self.assertIn('id="groupVisitCapturePanel"', self.ui)
+        self.assertIn('Collective check-in', self.ui)
+        self.assertIn('Collective check-out', self.ui)
+        self.assertIn('Capture & match roster', self.ui)
+        self.assertIn('drawGroupVisitAnnotations(groupVisitPhoto,data)', self.ui)
+        self.assertIn('LIVE MODE · GATED', self.ui)
+        self.assertIn('No mock fallback will occur.', self.ui)
+        self.assertIn("/api/v1/group-visits/${encodeURIComponent(groupId)}/scan", self.ui)
+        self.assertIn('function closeGroupVisitCapture()', self.ui)
+        self.assertIn("canvas.getContext('2d').clearRect(0,0,canvas.width,canvas.height)", self.ui)
+        self.assertIn('VMS-GRP-007', (ROOT / "docs" / "REQUIREMENTS-TRACEABILITY.csv").read_text(encoding="utf-8-sig"))
+        self.assertIn('a group photograph is never used to create or update a biometric enrollment/template', (ROOT / "docs" / "GROUP-VISIT-WORKFLOW.md").read_text(encoding="utf-8").lower())
 
     def test_face_attendance_is_opt_in_and_group_photo_enrollment_is_blocked(self):
         face = (ROOT / "service" / "face_attendance.py").read_text(encoding="utf-8")

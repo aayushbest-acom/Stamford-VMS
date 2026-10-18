@@ -40,7 +40,7 @@ DEFAULT_LBPH_MAX_DISTANCE = 55.0
 STUDENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$")
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{1,95}$")
 REFERENCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,119}$")
-PERSON_TYPES = {"Student", "Staff", "Contractor"}
+PERSON_TYPES = {"Student", "Staff", "Contractor", "Guardian", "Other"}
 GENETEC_BRIDGE_DEFAULT = "http://127.0.0.1:5190"
 GENETEC_CREDENTIAL_REF_MAX = 20
 DATA_URL_RE = re.compile(r"^data:image/(?:jpeg|jpg|png|webp);base64,([A-Za-z0-9+/=\r\n]+)$", re.I)
@@ -78,6 +78,20 @@ def _require_genetec_cardholder_face_sync() -> None:
             403,
             "GENETEC_CARDHOLDER_FACE_SYNC_DISABLED",
             "Genetec Cardholder photo import is disabled. It requires STAMFORD_GENETEC_CARDHOLDER_FACE_SYNC_APPROVED=1 after written school approval, in addition to the student face-attendance gates.",
+        )
+
+
+def _genetec_attendance_event_sync_gate() -> bool:
+    return _genetec_cardholder_face_sync_gate() and _truthy_env("STAMFORD_GENETEC_ATTENDANCE_EVENT_SYNC_APPROVED")
+
+
+def _require_genetec_attendance_event_sync() -> None:
+    _require_genetec_cardholder_face_sync()
+    if not _truthy_env("STAMFORD_GENETEC_ATTENDANCE_EVENT_SYNC_APPROVED"):
+        raise FaceAttendanceError(
+            403,
+            "GENETEC_ATTENDANCE_EVENT_SYNC_DISABLED",
+            "Real-time Genetec attendance event sync is disabled. Set STAMFORD_GENETEC_ATTENDANCE_EVENT_SYNC_APPROVED=1 only after the custom event and school approval are configured.",
         )
 
 
@@ -120,6 +134,46 @@ def _genetec_bridge_get(path: str, query: dict | None = None) -> dict:
         code = parsed_json.get("errorCode") or "GENETEC_RESPONSE_NOT_VERIFIED"
         raise FaceAttendanceError(503, str(code)[:80], str(message)[:300])
     return parsed_json
+
+
+def _genetec_bridge_post(path: str, payload: dict) -> dict:
+    """POST a confirmed event only to the local Genetec bridge; never send biometric image data."""
+    base = os.environ.get("STAMFORD_GENETEC_BRIDGE_URL", GENETEC_BRIDGE_DEFAULT).strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(base)
+    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"} or parsed.username or parsed.password:
+        raise FaceAttendanceError(503, "GENETEC_BRIDGE_URL_NOT_LOOPBACK", "Genetec attendance event writes are restricted to the local loopback bridge.")
+    if path != "/api/genetec/cardholder-attendance-event":
+        raise FaceAttendanceError(500, "GENETEC_BRIDGE_PATH_INVALID", "Internal Genetec attendance write route is not allow-listed.")
+    raw_payload = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(
+        base + path,
+        data=raw_payload,
+        headers={"Accept": "application/json", "Content-Type": "application/json", "Origin": "http://127.0.0.1:8080"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=35) as response:
+            raw = response.read(128_001)
+            if len(raw) > 128_000:
+                raise FaceAttendanceError(502, "GENETEC_RESPONSE_TOO_LARGE", "The local Genetec attendance response exceeded the size limit.")
+            result = json.loads(raw.decode("utf-8"))
+    except FaceAttendanceError:
+        raise
+    except urllib.error.HTTPError as exc:
+        try:
+            error_payload = json.loads(exc.read(64_000).decode("utf-8"))
+        except Exception:
+            error_payload = {}
+        message = error_payload.get("error") or error_payload.get("message") or "Genetec bridge rejected the attendance event."
+        code = error_payload.get("errorCode") or "GENETEC_ATTENDANCE_EVENT_REJECTED"
+        raise FaceAttendanceError(exc.code if 400 <= exc.code < 600 else 503, str(code)[:80], str(message)[:500]) from exc
+    except (urllib.error.URLError, TimeoutError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise FaceAttendanceError(503, "GENETEC_BRIDGE_UNAVAILABLE", "The local Genetec bridge could not be reached or returned invalid JSON. Attendance remains in the local outbox; inspect Genetec before any manual retry.") from exc
+    if not isinstance(result, dict) or result.get("success") is not True:
+        message = result.get("error") or result.get("message") or "Genetec bridge returned an unverified attendance response."
+        code = result.get("errorCode") or "GENETEC_ATTENDANCE_RESPONSE_NOT_VERIFIED"
+        raise FaceAttendanceError(503, str(code)[:80], str(message)[:500])
+    return result
 
 
 def _safe_genetec_profile_metadata(raw: object) -> dict:
@@ -233,10 +287,10 @@ def _validate_session(value: object) -> str:
 def _person_type(value: object) -> str:
     """Normalize one of the person categories explicitly supported by the kiosk."""
     if not isinstance(value, str):
-        raise FaceAttendanceError(400, "PERSON_TYPE_REQUIRED", "Choose Student, Staff or Contractor.")
+        raise FaceAttendanceError(400, "PERSON_TYPE_REQUIRED", "Choose Student, Staff, Contractor, Guardian or Other.")
     canonical = next((item for item in PERSON_TYPES if item.casefold() == value.strip().casefold()), None)
     if canonical is None:
-        raise FaceAttendanceError(400, "INVALID_PERSON_TYPE", "personType must be Student, Staff or Contractor.")
+        raise FaceAttendanceError(400, "INVALID_PERSON_TYPE", "personType must be Student, Staff, Contractor, Guardian or Other.")
     return canonical
 
 
@@ -320,8 +374,13 @@ def _image_bytes(data_url: object) -> bytes:
     return raw
 
 
-def _extract_faces(data_url: object, max_faces: int = MAX_GROUP_FACES) -> list[bytes]:
-    _require_feature()
+def _extract_faces_with_boxes(data_url: object, max_faces: int = MAX_GROUP_FACES, *, group_workflow: bool = False) -> tuple[list[dict], int, int]:
+    """Detect faces locally and return prepared crops plus source-image bounding boxes.
+
+    Bounding boxes are coordinates in the submitted frame; the submitted group photo is
+    not retained or used to enrol people by this function.
+    """
+    _require_feature(group=group_workflow)
     cv2, np = _opencv_module()
     raw = _image_bytes(data_url)
     img = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -337,11 +396,12 @@ def _extract_faces(data_url: object, max_faces: int = MAX_GROUP_FACES) -> list[b
         raise FaceAttendanceError(503, "FACE_DETECTOR_UNAVAILABLE", "The local OpenCV face detector could not be loaded.")
     faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(48, 48))
     if len(faces) == 0:
-        raise FaceAttendanceError(422, "NO_FACE_DETECTED", "No face was detected. Improve lighting and frame one face fully.")
+        raise FaceAttendanceError(422, "NO_FACE_DETECTED", "No face was detected. Improve lighting and capture the group again.")
     if len(faces) > max_faces:
         raise FaceAttendanceError(413, "TOO_MANY_FACES", f"Detected more than the allowed {max_faces} faces for one scan.")
-    output: list[bytes] = []
-    for x, y, w, h in sorted(faces, key=lambda box: (int(box[1]), int(box[0]))):
+    output: list[dict] = []
+    ordered = sorted(faces, key=lambda box: (int(box[1]), int(box[0])))
+    for index, (x, y, w, h) in enumerate(ordered, start=1):
         pad_x = int(w * 0.12)
         pad_y = int(h * 0.12)
         x0, y0 = max(0, int(x) - pad_x), max(0, int(y) - pad_y)
@@ -352,8 +412,14 @@ def _extract_faces(data_url: object, max_faces: int = MAX_GROUP_FACES) -> list[b
         ok, encoded = cv2.imencode(".png", crop)
         if not ok:
             raise FaceAttendanceError(500, "FACE_PREPROCESS_FAILED", "The local face crop could not be prepared.")
-        output.append(encoded.tobytes())
-    return output
+        output.append({"cropBytes": encoded.tobytes(), "faceIndex": index, "boundingBox": {"x": int(x), "y": int(y), "width": int(w), "height": int(h)}})
+    return output, int(width), int(height)
+
+
+def _extract_faces(data_url: object, max_faces: int = MAX_GROUP_FACES) -> list[bytes]:
+    """Compatibility wrapper used by single-face/enrolment flows."""
+    detections, _, _ = _extract_faces_with_boxes(data_url, max_faces=max_faces)
+    return [item["cropBytes"] for item in detections]
 
 
 def _decode_crop(crop_bytes: bytes):
@@ -502,9 +568,24 @@ class FaceAttendanceStore:
                     ticket_id TEXT NOT NULL UNIQUE REFERENCES kiosk_face_mock_tickets(ticket_id),
                     UNIQUE(person_type,person_id,session_id,event_type)
                 );
+                CREATE TABLE IF NOT EXISTS genetec_attendance_outbox (
+                    attendance_id TEXT PRIMARY KEY,
+                    cardholder_guid TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL CHECK(event_type IN ('CheckIn','CheckOut')),
+                    occurred_at_utc TEXT NOT NULL,
+                    confirmation_method TEXT NOT NULL,
+                    sync_status TEXT NOT NULL DEFAULT 'pending' CHECK(sync_status IN ('pending','raised-unverified','manual-review')),
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_attempt_at_utc TEXT,
+                    submitted_at_utc TEXT,
+                    last_error_code TEXT,
+                    last_error_message TEXT
+                );
                 CREATE INDEX IF NOT EXISTS idx_face_samples_student ON face_samples(student_id);
                 CREATE INDEX IF NOT EXISTS idx_attendance_session ON student_attendance_events(session_id,group_event_id);
                 CREATE INDEX IF NOT EXISTS idx_face_tickets_expiry ON face_match_tickets(expires_at_utc);
+                CREATE INDEX IF NOT EXISTS idx_genetec_attendance_sync_pending ON genetec_attendance_outbox(sync_status,occurred_at_utc);
             """)
             # Backward-compatible additive migrations for existing Milestone 5.2 biometric databases.
             for table, column, definition in (
@@ -520,6 +601,70 @@ class FaceAttendanceStore:
                 if column not in existing_columns:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_face_enrollments_genetec_guid ON face_enrollments(genetec_cardholder_guid) WHERE genetec_cardholder_guid IS NOT NULL")
+
+    def _enqueue_genetec_attendance_sync(self, conn: sqlite3.Connection, attendance_id: str, cardholder_guid: object,
+                                           session_id: str, event_type: str, occurred_at_utc: str,
+                                           confirmation_method: str) -> bool:
+        """Stage a durable sync only when a real Genetec Cardholder GUID is linked to the enrollment."""
+        try:
+            guid = str(uuid.UUID(str(cardholder_guid)))
+        except (ValueError, TypeError, AttributeError):
+            return False
+        conn.execute(
+            "INSERT OR IGNORE INTO genetec_attendance_outbox(attendance_id,cardholder_guid,session_id,event_type,occurred_at_utc,confirmation_method,sync_status) VALUES(?,?,?,?,?,?, 'pending')",
+            (attendance_id, guid, session_id, event_type, occurred_at_utc, confirmation_method),
+        )
+        return True
+
+    def _sync_genetec_attendance_event(self, attendance_id: str) -> dict:
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT * FROM genetec_attendance_outbox WHERE attendance_id=?", (attendance_id,)).fetchone()
+        if row is None:
+            return {"status": "not-linked", "eventRaised": False, "message": "No Genetec Cardholder link exists for this attendance event."}
+        if row["sync_status"] == "raised-unverified":
+            return {"status": "raised-unverified", "eventRaised": True, "message": "The bridge accepted the native event raise call; Security Center Activity read-back is still required."}
+        if row["sync_status"] == "manual-review":
+            return {"status": "manual-review", "eventRaised": False, "message": "The bridge reported an ambiguous outcome. Inspect Cardholder Activity before any retry."}
+        if not _genetec_attendance_event_sync_gate():
+            return {"status": "disabled", "eventRaised": False, "message": "Attendance was saved locally; Genetec event sync is disabled by configuration or policy gates."}
+
+        attempted_at = _iso_utc()
+        try:
+            bridge_result = _genetec_bridge_post("/api/genetec/cardholder-attendance-event", {
+                "confirmation": "WRITE CONFIRMED STAMFORD VMS ATTENDANCE EVENT",
+                "attendanceEventId": row["attendance_id"],
+                "cardholderGuid": row["cardholder_guid"],
+                "eventType": row["event_type"],
+                "eventAtUtc": row["occurred_at_utc"],
+                "sessionId": row["session_id"],
+                "confirmationMethod": row["confirmation_method"],
+                "humanConfirmed": True,
+            })
+            if bridge_result.get("eventRaised") is not True:
+                raise FaceAttendanceError(503, "GENETEC_EVENT_RAISE_NOT_CONFIRMED", "The bridge response did not confirm a custom-event raise.")
+            with self._lock, closing(self._connect()) as conn:
+                conn.execute("UPDATE genetec_attendance_outbox SET sync_status='raised-unverified',attempt_count=attempt_count+1,last_attempt_at_utc=?,submitted_at_utc=?,last_error_code=NULL,last_error_message=NULL WHERE attendance_id=?", (attempted_at, _iso_utc(), attendance_id))
+            return {"status": "raised-unverified", "eventRaised": True, "message": bridge_result.get("message") or "Custom event raise submitted; read-back not independently verified."}
+        except FaceAttendanceError as exc:
+            status = "manual-review" if exc.code in {"ATTENDANCE_EVENT_OUTCOME_UNKNOWN", "ATTENDANCE_EVENT_ID_CONFLICT", "ATTENDANCE_EVENT_RAISE_OUTCOME_UNKNOWN"} else "pending"
+            with self._lock, closing(self._connect()) as conn:
+                conn.execute("UPDATE genetec_attendance_outbox SET sync_status=?,attempt_count=attempt_count+1,last_attempt_at_utc=?,last_error_code=?,last_error_message=? WHERE attendance_id=?", (status, attempted_at, exc.code[:80], exc.message[:500], attendance_id))
+            return {"status": status, "eventRaised": False, "errorCode": exc.code, "message": exc.message}
+
+    def retry_pending_genetec_attendance(self, payload: object) -> dict:
+        _require_genetec_attendance_event_sync()
+        limit = 100
+        if isinstance(payload, dict) and payload.get("limit") is not None:
+            try:
+                limit = int(payload.get("limit"))
+            except (TypeError, ValueError) as exc:
+                raise FaceAttendanceError(400, "INVALID_RETRY_LIMIT", "limit must be an integer between 1 and 100.") from exc
+        if limit < 1 or limit > 100:
+            raise FaceAttendanceError(400, "INVALID_RETRY_LIMIT", "limit must be an integer between 1 and 100.")
+        with closing(self._connect()) as conn:
+            rows = conn.execute("SELECT attendance_id FROM genetec_attendance_outbox WHERE sync_status='pending' ORDER BY occurred_at_utc LIMIT ?", (limit,)).fetchall()
+        results = [{"attendanceId": row["attendance_id"], **self._sync_genetec_attendance_event(row["attendance_id"])} for row in rows]
+        return {"ok": True, "count": len(results), "raisedUnverifiedCount": sum(1 for item in results if item["status"] == "raised-unverified"), "pendingCount": sum(1 for item in results if item["status"] == "pending"), "manualReviewCount": sum(1 for item in results if item["status"] == "manual-review"), "events": results, "message": "Raised-unverified means the SDK raise call returned successfully; confirm the event in Genetec Cardholder Activity before treating delivery as accepted."}
 
     def _audit(self, conn: sqlite3.Connection, action: str, student_id: str | None, session_id: str | None, outcome: str, details: dict | None = None):
         conn.execute(
@@ -542,6 +687,8 @@ class FaceAttendanceStore:
             "groupApprovalFlag": _truthy_env("STAMFORD_GROUP_FACE_IDENTIFICATION_APPROVED"),
             "genetecCardholderFaceSyncEnabled": _genetec_cardholder_face_sync_gate(),
             "genetecCardholderFaceSyncApprovedFlag": _truthy_env("STAMFORD_GENETEC_CARDHOLDER_FACE_SYNC_APPROVED"),
+            "genetecAttendanceEventSyncEnabled": _genetec_attendance_event_sync_gate(),
+            "genetecAttendanceEventSyncApprovedFlag": _truthy_env("STAMFORD_GENETEC_ATTENDANCE_EVENT_SYNC_APPROVED"),
             "engineAvailable": cv2 is not None,
             "encryptedStorageAvailable": os.name == "nt",
             "activeEnrolledStudents": int(active_students),
@@ -576,6 +723,8 @@ class FaceAttendanceStore:
             "activeEnrolledByPersonType": base["activeEnrolledByPersonType"],
             "imageRetention": "Camera frame is processed in memory and is not saved by the kiosk adapter.",
             "liveGalleryBoundary": "Live mode searches only active, individually approved profiles linked to a Genetec Cardholder portrait and an additional camera sample.",
+            "genetecAttendanceEventSyncEnabled": _genetec_attendance_event_sync_gate(),
+            "genetecAttendanceSyncSemantics": "Native Cardholder custom event submission; Security Center activity read-back remains required before calling it verified.",
             "authentication": "not-configured-prototype-only",
         }
 
@@ -1289,6 +1438,7 @@ class FaceAttendanceStore:
                     "affiliation": item["class_name"], "sessionId": item["session_id"],
                     "eventType": item["event_type"], "occurredAtUtc": item["occurred_at_utc"],
                     "confirmationMethod": "KioskSelfConfirmed" if item["operator_name"] == "Kiosk self-confirmed" else "StaffVerified",
+                    "genetecSyncStatus": item.get("genetecSyncStatus", "not-linked"),
                     "simulated": False,
                 })
             return {"ok": True, "mode": "live", "sessionId": session, "events": events, "count": len(events), "writtenToGenetec": False}
@@ -1310,7 +1460,7 @@ class FaceAttendanceStore:
                 "cardholderGuid": row["cardholder_guid"], "credentialReferences": credential_refs,
                 "sessionId": row["session_id"], "eventType": row["event_type"],
                 "occurredAtUtc": row["occurred_at_utc"], "confirmationMethod": row["confirmation_method"],
-                "simulated": True,
+                "genetecSyncStatus": "disabled", "simulated": True,
             })
         return {"ok": True, "mode": "mock", "sessionId": session or None, "events": events, "count": len(events), "writtenToGenetec": False}
 
@@ -1325,23 +1475,27 @@ class FaceAttendanceStore:
         if not isinstance(roster_raw, list) or not roster_raw or len(roster_raw) > MAX_ROSTER_SIZE:
             raise FaceAttendanceError(400, "INVALID_ROSTER", f"studentIds must contain 1–{MAX_ROSTER_SIZE} pre-enrolled roster IDs.")
         roster_ids = list(dict.fromkeys(_validate_id(item) for item in roster_raw))
-        faces = _extract_faces(payload.get("imageData"), max_faces=MAX_GROUP_FACES)
-        recognizer, id_by_label, profiles, max_distance = self._training_data(roster_ids, person_type="Student")
+        detections, image_width, image_height = _extract_faces_with_boxes(payload.get("imageData"), max_faces=MAX_GROUP_FACES, group_workflow=True)
+        # A group roster can contain any supported person category, but only IDs supplied
+        # by the booking service are eligible for this comparison.
+        recognizer, id_by_label, profiles, max_distance = self._training_data(roster_ids, person_type=None)
         candidates = []
-        seen_students: set[str] = set()
-        for index, crop in enumerate(faces, start=1):
-            label, distance = recognizer.predict(_decode_crop(crop))
+        seen_people: set[str] = set()
+        for detection in detections:
+            index = detection["faceIndex"]
+            label, distance = recognizer.predict(_decode_crop(detection["cropBytes"]))
             student_id = id_by_label.get(int(label))
+            box = detection["boundingBox"]
             if not student_id or float(distance) > max_distance:
-                candidates.append({"faceIndex": index, "matched": False, "reason": "NO_CONFIDENT_MATCH", "message": "No eligible roster match; staff must reconcile manually."})
+                candidates.append({"faceIndex": index, "boundingBox": box, "matched": False, "reason": "NO_CONFIDENT_MATCH", "message": "No eligible approved profile matched; staff must reconcile this attendee manually."})
                 continue
-            if student_id in seen_students:
-                candidates.append({"faceIndex": index, "matched": False, "reason": "DUPLICATE_CANDIDATE", "message": "The same student was suggested for more than one face; this face must be reconciled manually."})
+            if student_id in seen_people:
+                candidates.append({"faceIndex": index, "boundingBox": box, "matched": False, "reason": "DUPLICATE_CANDIDATE", "message": "The same roster person was suggested for multiple faces; this face must be reconciled manually."})
                 continue
-            seen_students.add(student_id)
+            seen_people.add(student_id)
             ticket = self._new_ticket("group", session_id, event_type, student_id, group_event_id, float(distance))
-            candidates.append({"faceIndex": index, "matched": True, "candidate": profiles[student_id], "distance": round(float(distance), 3), "ticketId": ticket, "ticketExpiresInSeconds": TICKET_TTL_SECONDS, "humanConfirmationRequired": True})
-        return {"ok": True, "groupEventId": group_event_id, "eventType": event_type, "detectedFaceCount": len(faces), "candidates": candidates, "groupImagePersisted": False, "groupImageUsedForEnrollment": False, "humanRosterReconciliationRequired": True, "message": "Matches are limited to this approved, consented roster. Review every candidate; no attendance is recorded until an operator explicitly confirms the batch."}
+            candidates.append({"faceIndex": index, "boundingBox": box, "matched": True, "candidate": profiles[student_id], "distance": round(float(distance), 3), "ticketId": ticket, "ticketExpiresInSeconds": TICKET_TTL_SECONDS, "humanConfirmationRequired": True})
+        return {"ok": True, "groupEventId": group_event_id, "eventType": event_type, "detectedFaceCount": len(detections), "imageWidth": image_width, "imageHeight": image_height, "candidates": candidates, "groupImagePersisted": False, "groupImageUsedForEnrollment": False, "humanRosterReconciliationRequired": True, "message": "Matches are limited to this booking's approved, consented, pre-enrolled roster across all supported categories. Review every candidate; no attendance is recorded until an operator explicitly confirms the batch."}
 
     def _confirm_in_tx(self, conn: sqlite3.Connection, ticket_id: object, student_id: object, operator: object, expected_mode: str, expected_session: str | None, expected_group_id: str | None):
         if not isinstance(ticket_id, str) or not 24 <= len(ticket_id) <= 80:
@@ -1394,13 +1548,15 @@ class FaceAttendanceStore:
                 now = _iso_utc()
                 identity_link = conn.execute("SELECT person_type,genetec_cardholder_guid,genetec_credential_refs_json FROM face_enrollments WHERE student_id=?", (student_id,)).fetchone()
                 conn.execute("INSERT INTO student_attendance_events(attendance_id,student_id,session_id,event_type,group_event_id,occurred_at_utc,operator_name,ticket_id,model_distance,genetec_cardholder_guid,genetec_credential_refs_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (attendance_id, student_id, row["session_id"], row["event_type"], row["group_event_id"], now, operator, ticket_id, row["distance"], identity_link["genetec_cardholder_guid"], identity_link["genetec_credential_refs_json"]))
+                sync_enqueued = self._enqueue_genetec_attendance_sync(conn, attendance_id, identity_link["genetec_cardholder_guid"], row["session_id"], row["event_type"], now, confirmation_method)
                 conn.execute("UPDATE face_match_tickets SET consumed_at_utc=? WHERE ticket_id=?", (now, ticket_id))
                 self._audit(conn, "KioskAttendanceRecorded" if confirmation_method == "KioskSelfConfirmed" else "StudentAttendanceRecorded", student_id, row["session_id"], "Success", {"personType": identity_link["person_type"], "eventType": row["event_type"], "groupEventId": row["group_event_id"], "operator": operator, "confirmationMethod": confirmation_method, "ticketId": ticket_id, "modelDistance": round(float(row["distance"]), 3)})
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
-        return {"ok": True, "attendanceId": attendance_id, "studentId": student_id, "personType": identity_link["person_type"], "sessionId": row["session_id"], "groupEventId": row["group_event_id"] or None, "eventType": row["event_type"], "occurredAtUtc": now, "operator": operator, "confirmationMethod": confirmation_method, "humanConfirmed": True}
+        sync = self._sync_genetec_attendance_event(attendance_id) if sync_enqueued else {"status": "not-linked", "eventRaised": False, "message": "This approved profile is not linked to a Genetec Cardholder, so only the local attendance ledger was updated."}
+        return {"ok": True, "attendanceId": attendance_id, "studentId": student_id, "personType": identity_link["person_type"], "sessionId": row["session_id"], "groupEventId": row["group_event_id"] or None, "eventType": row["event_type"], "occurredAtUtc": now, "operator": operator, "confirmationMethod": confirmation_method, "humanConfirmed": True, "genetecSyncStatus": sync["status"], "genetecEventRaised": bool(sync.get("eventRaised")), "writtenToGenetec": False, "genetecSyncMessage": sync.get("message"), "genetecSyncErrorCode": sync.get("errorCode")}
 
     def confirm_group_batch(self, payload: object) -> dict:
         self._assert_ready(group=True)
@@ -1430,19 +1586,31 @@ class FaceAttendanceStore:
                     checked.append(self._confirm_in_tx(conn, ticket_id, student_id, operator, "group", session_id, group_event_id))
                 now = _iso_utc()
                 result_rows = []
+                sync_ids = []
                 for row, student_id, actor in checked:
                     ticket_id = row["ticket_id"]
                     attendance_id = "ATT-" + secrets.token_hex(12).upper()
                     identity_link = conn.execute("SELECT person_type,genetec_cardholder_guid,genetec_credential_refs_json FROM face_enrollments WHERE student_id=?", (student_id,)).fetchone()
                     conn.execute("INSERT INTO student_attendance_events(attendance_id,student_id,session_id,event_type,group_event_id,occurred_at_utc,operator_name,ticket_id,model_distance,genetec_cardholder_guid,genetec_credential_refs_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (attendance_id, student_id, session_id, row["event_type"], group_event_id, now, actor, ticket_id, row["distance"], identity_link["genetec_cardholder_guid"], identity_link["genetec_credential_refs_json"]))
+                    sync_enqueued = self._enqueue_genetec_attendance_sync(conn, attendance_id, identity_link["genetec_cardholder_guid"], session_id, row["event_type"], now, "StaffVerifiedGroupBatch")
+                    if sync_enqueued:
+                        sync_ids.append(attendance_id)
                     conn.execute("UPDATE face_match_tickets SET consumed_at_utc=? WHERE ticket_id=?", (now, ticket_id))
-                    self._audit(conn, "GroupAttendanceRecorded", student_id, session_id, "Success", {"eventType": row["event_type"], "groupEventId": group_event_id, "operator": actor, "ticketId": ticket_id, "modelDistance": round(float(row["distance"]), 3)})
-                    result_rows.append({"attendanceId": attendance_id, "studentId": student_id, "personType": identity_link["person_type"], "eventType": row["event_type"], "occurredAtUtc": now, "operator": actor, "humanConfirmed": True})
+                    self._audit(conn, "GroupAttendanceRecorded", student_id, session_id, "Success", {"eventType": row["event_type"], "groupEventId": group_event_id, "operator": actor, "ticketId": ticket_id, "modelDistance": round(float(row["distance"]), 3), "genetecSyncEnqueued": sync_enqueued})
+                    result_rows.append({"attendanceId": attendance_id, "studentId": student_id, "personType": identity_link["person_type"], "eventType": row["event_type"], "occurredAtUtc": now, "operator": actor, "humanConfirmed": True, "genetecSyncStatus": "pending" if sync_enqueued else "not-linked", "genetecEventRaised": False})
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
-        return {"ok": True, "groupEventId": group_event_id, "sessionId": session_id, "recordedCount": len(result_rows), "events": result_rows, "humanConfirmed": True, "groupImagePersisted": False}
+        sync_by_attendance = {attendance_id: self._sync_genetec_attendance_event(attendance_id) for attendance_id in sync_ids}
+        for item in result_rows:
+            sync = sync_by_attendance.get(item["attendanceId"])
+            if sync:
+                item["genetecSyncStatus"] = sync["status"]
+                item["genetecEventRaised"] = bool(sync.get("eventRaised"))
+                item["genetecSyncMessage"] = sync.get("message")
+                item["genetecSyncErrorCode"] = sync.get("errorCode")
+        return {"ok": True, "groupEventId": group_event_id, "sessionId": session_id, "recordedCount": len(result_rows), "events": result_rows, "humanConfirmed": True, "groupImagePersisted": False, "genetecSyncQueuedCount": len(sync_ids), "genetecEventRaisedCount": sum(1 for x in result_rows if x.get("genetecEventRaised")), "genetecSyncRequiresReadback": any(x.get("genetecSyncStatus") == "raised-unverified" for x in result_rows)}
 
     def list_events(self, session_id: object, group_event_id: object = "") -> dict:
         self._assert_ready()
@@ -1452,10 +1620,11 @@ class FaceAttendanceStore:
         else:
             group_event_id = ""
         with closing(self._connect()) as conn:
-            rows = conn.execute("SELECT e.attendance_id,e.student_id,p.display_name,p.class_name,p.person_type,e.session_id,e.event_type,e.group_event_id,e.occurred_at_utc,e.operator_name,e.genetec_cardholder_guid,e.genetec_credential_refs_json FROM student_attendance_events e JOIN face_enrollments p USING(student_id) WHERE e.session_id=? AND e.group_event_id=? ORDER BY e.occurred_at_utc", (session_id, group_event_id)).fetchall()
+            rows = conn.execute("SELECT e.attendance_id,e.student_id,p.display_name,p.class_name,p.person_type,e.session_id,e.event_type,e.group_event_id,e.occurred_at_utc,e.operator_name,e.genetec_cardholder_guid,e.genetec_credential_refs_json,COALESCE(o.sync_status,'not-linked') AS genetec_sync_status FROM student_attendance_events e JOIN face_enrollments p USING(student_id) LEFT JOIN genetec_attendance_outbox o ON o.attendance_id=e.attendance_id WHERE e.session_id=? AND e.group_event_id=? ORDER BY e.occurred_at_utc", (session_id, group_event_id)).fetchall()
         events = []
         for row in rows:
             item = dict(row)
+            item["genetecSyncStatus"] = item.pop("genetec_sync_status", "not-linked")
             try: item["genetecCredentialReferences"] = _safe_genetec_credential_refs(json.loads(item.pop("genetec_credential_refs_json") or "[]"))
             except Exception: item["genetecCredentialReferences"] = []
             events.append(item)

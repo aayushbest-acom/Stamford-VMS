@@ -80,6 +80,120 @@ class DomainApiTests(unittest.TestCase):
         raw_db = self.state_store.db_path.read_bytes()
         self.assertNotIn(token.encode("ascii"), raw_db)
 
+    def test_prepopulated_visitor_types_are_available_and_include_school_use_cases(self):
+        code, result = self.request("GET", "/api/v1/visitor-types")
+        self.assertEqual(code, 200, result)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["persistence"], "sqlite-local")
+        names = {row["name"] for row in result["visitorTypes"] if row["isActive"]}
+        self.assertTrue({"Parent / Guardian", "Contractor", "Vendor / Supplier", "Delivery / Courier", "Prospective Family", "General Visitor", "Other"}.issubset(names))
+        self.assertTrue(all(row["isBuiltIn"] for row in result["visitorTypes"]))
+
+    def test_custom_visitor_type_is_persisted_on_invitation_and_list_record(self):
+        code, created_type = self.request("POST", "/api/v1/visitor-types", {"name": "Exam Candidate", "description": "External candidate attending an examination"})
+        self.assertEqual(code, 201, created_type)
+        visitor_type = created_type["visitorType"]
+        self.assertTrue(visitor_type["isActive"])
+        self.assertFalse(visitor_type["isBuiltIn"])
+
+        payload = dict(self.payload, id="VMS-TEST-TYPE-01", visitorTypeId=visitor_type["id"])
+        code, created_visit = self.request("POST", "/api/v1/visits", payload)
+        self.assertEqual(code, 201, created_visit)
+        self.assertEqual(created_visit["visit"]["visitorTypeId"], visitor_type["id"])
+        self.assertEqual(created_visit["visit"]["visitorType"], "Exam Candidate")
+
+        code, listed = self.request("GET", "/api/v1/visits")
+        self.assertEqual(code, 200)
+        saved = next(row for row in listed["visits"] if row["id"] == "VMS-TEST-TYPE-01")
+        self.assertEqual(saved["visitorType"], "Exam Candidate")
+
+    def test_duplicate_visitor_type_names_are_rejected_case_insensitively(self):
+        code, result = self.request("POST", "/api/v1/visitor-types", {"name": "Exam Candidate"})
+        self.assertEqual(code, 201, result)
+        code, duplicate = self.request("POST", "/api/v1/visitor-types", {"name": " exam candidate "})
+        self.assertEqual(code, 409)
+        self.assertEqual(duplicate["error"], "VISITOR_TYPE_NAME_EXISTS")
+
+    def test_inactive_visitor_type_is_hidden_from_active_list_and_rejected_for_new_invitation(self):
+        update_code, updated = self.request("POST", "/api/v1/visitor-types/contractor/update", {"isActive": False})
+        self.assertEqual(update_code, 200, updated)
+        self.assertFalse(updated["visitorType"]["isActive"])
+        code, active = self.request("GET", "/api/v1/visitor-types?includeInactive=0")
+        self.assertEqual(code, 200)
+        self.assertNotIn("contractor", {row["id"] for row in active["visitorTypes"]})
+        code, all_types = self.request("GET", "/api/v1/visitor-types?includeInactive=1")
+        self.assertEqual(code, 200)
+        self.assertIn("contractor", {row["id"] for row in all_types["visitorTypes"]})
+
+        payload = dict(self.payload, id="VMS-TEST-INACTIVE-TYPE-01", visitorTypeId="contractor")
+        code, rejected = self.request("POST", "/api/v1/visits", payload)
+        self.assertEqual(code, 400)
+        self.assertEqual(rejected["error"], "VISITOR_TYPE_INACTIVE_OR_UNKNOWN")
+
+    def test_existing_invitation_keeps_visitor_type_snapshot_after_type_rename_or_deactivation(self):
+        payload = dict(self.payload, id="VMS-TEST-TYPE-SNAPSHOT-01", visitorTypeId="contractor")
+        code, created = self.request("POST", "/api/v1/visits", payload)
+        self.assertEqual(code, 201, created)
+        code, updated = self.request("POST", "/api/v1/visitor-types/contractor/update", {"name": "Approved Contractor", "isActive": False})
+        self.assertEqual(code, 200, updated)
+        code, reread = self.request("GET", "/api/v1/visits")
+        self.assertEqual(code, 200)
+        visit = next(row for row in reread["visits"] if row["id"] == "VMS-TEST-TYPE-SNAPSHOT-01")
+        self.assertEqual(visit["visitorTypeId"], "contractor")
+        self.assertEqual(visit["visitorType"], "Contractor")
+
+    def test_general_visitor_is_the_compatibility_default_but_unknown_explicit_type_fails_closed(self):
+        legacy_payload = dict(self.payload, id="VMS-TEST-TYPE-DEFAULT-01")
+        code, created = self.request("POST", "/api/v1/visits", legacy_payload)
+        self.assertEqual(code, 201, created)
+        self.assertEqual(created["visit"]["visitorTypeId"], "general-visitor")
+        self.assertEqual(created["visit"]["visitorType"], "General Visitor")
+
+        bad_payload = dict(self.payload, id="VMS-TEST-TYPE-UNKNOWN-01", visitorTypeId="no-such-type")
+        code, result = self.request("POST", "/api/v1/visits", bad_payload)
+        self.assertEqual(code, 400)
+        self.assertEqual(result["error"], "VISITOR_TYPE_INACTIVE_OR_UNKNOWN")
+
+    def test_legacy_database_migrates_existing_visit_to_general_visitor_without_losing_qr_hash(self):
+        legacy_db = self.root / "legacy-before-visitor-types.sqlite3"
+        with closing(sqlite3.connect(legacy_db)) as conn:
+            conn.execute("""CREATE TABLE domain_visits (
+                booking_id TEXT PRIMARY KEY,
+                visitor_name TEXT NOT NULL,
+                visitor_email TEXT NOT NULL DEFAULT '',
+                host_name TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                purpose TEXT NOT NULL DEFAULT '',
+                visit_date TEXT NOT NULL,
+                visit_window TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('Invited','Inside','Overdue','Checked out','Cancelled')),
+                qr_token_hash TEXT UNIQUE,
+                qr_expires_at_utc TEXT,
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                checked_in_at_utc TEXT,
+                checked_out_at_utc TEXT,
+                revoked_at_utc TEXT,
+                row_version INTEGER NOT NULL DEFAULT 1
+            )""")
+            token_hash = "a" * 64
+            conn.execute("""INSERT INTO domain_visits(
+                booking_id,visitor_name,visitor_email,host_name,destination,purpose,visit_date,visit_window,status,
+                qr_token_hash,qr_expires_at_utc,created_at_utc,updated_at_utc,row_version)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ("VMS-LEGACY-01", "Legacy Visitor", "", "Legacy Host", "Main Reception", "Existing booking",
+                 "2026-10-19", "09:00–10:00", "Invited", token_hash, "2026-10-20T02:00:00Z",
+                 "2026-10-18T12:00:00Z", "2026-10-18T12:00:00Z", 1))
+            conn.commit()
+
+        migrated = DomainStore(legacy_db).get_visit("VMS-LEGACY-01")
+        self.assertIsNotNone(migrated)
+        self.assertEqual(migrated["visitorTypeId"], "general-visitor")
+        self.assertEqual(migrated["visitorType"], "General Visitor")
+        with closing(sqlite3.connect(legacy_db)) as conn:
+            saved_hash = conn.execute("SELECT qr_token_hash FROM domain_visits WHERE booking_id='VMS-LEGACY-01'").fetchone()[0]
+        self.assertEqual(saved_hash, token_hash)
+
     @unittest.skipUnless(importlib.util.find_spec("cv2") and importlib.util.find_spec("numpy"), "Optional OpenCV scanner dependency is unavailable")
     def test_local_camera_qr_frame_endpoint_decodes_token_without_persisting_frame(self):
         # Importing the VMS QR helper adds the bundled QR encoder to sys.path.

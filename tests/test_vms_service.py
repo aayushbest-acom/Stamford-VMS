@@ -51,7 +51,7 @@ class VmsServiceTests(unittest.TestCase):
         self.assertTrue(body["boundToLoopback"])
         self.assertEqual(body["authentication"], "not-configured")
         self.assertEqual(body["mode"], "prototype-only")
-        self.assertEqual(body["build"], "5.2.4")
+        self.assertEqual(body["build"], "5.4.0")
 
     def test_face_attendance_feature_is_gated_by_default(self):
         with patch.dict(os.environ, {}, clear=True):

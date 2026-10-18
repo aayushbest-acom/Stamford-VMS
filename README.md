@@ -1,18 +1,19 @@
 # Stamford VMS Prototype Repository
 
 **Project:** ACOM × Stamford American International School — Visitor Management System
-**Current milestone:** 5.2.4 — kiosk Student/Staff/Contractor attendance flow with explicit mock/live boundaries
+**Current milestone:** 5.4.0 — operational report catalogue and multi-format exports, building on Group Visits, visitor types and Stamford branding
 **Repository status:** Prototype source, synthetic data, and a loopback-only .NET Framework bridge. Not a production release.
 
 ## What is in this repository
 
 - `ui/` — Stamford-branded browser prototype. Visitor, kiosk, group, replacement-card and AI-review workflows remain demonstrative unless explicitly stated otherwise.
 - `service/vms_service.py` — loopback-only HTTP service with SQLite snapshot persistence plus dedicated visitor-domain routes. `service/domain.py` implements transactional visit transitions and secure QR validation; neither service has production authentication/RBAC.
-- `tests/` — automated regression tests for snapshot persistence, domain transitions, QR token handling, retry idempotency, and source/credential-store safety contracts.
+- `tests/` — automated regression tests for snapshot persistence, domain transitions, reporting/export integrity, QR token handling, retry idempotency, and source/credential-store safety contracts.
 - `docs/REQUIREMENTS-TRACEABILITY.csv`, `docs/IMPLEMENTATION-STATUS.md` and `docs/VALIDATION-REPORT.md` — requirement-by-requirement delivery status, validation evidence and remaining acceptance gates. See `docs/GENETEC-LOCAL-CREDENTIAL-SETUP.md` for saving bridge credentials once.
 - `GenetecReadOnlyBridge/` — .NET Framework 4.8 bridge, using the locally installed Genetec Security Center 5.11 SDK. It binds only to `127.0.0.1:5190`.
 - `docs/Genetec-Visitor-Field-Mapping.md` — current narrow mapping for invited synthetic bookings to a native Genetec Visitor.
 - `DAY1-CLOSEOUT.md`, `VALIDATION-RESULTS.md` — implementation boundary and validation history.
+- `docs/REPORTING-EXPORTS.md` — report definitions, filters, supported formats, API endpoints and source limitations.
 - `patches/` — patch queues intended to be applied incrementally. See `patches/README.md`.
 
 ## Run the frontend
@@ -154,4 +155,27 @@ See [`docs/INTEGRATIONS-SETUP.md`](docs/INTEGRATIONS-SETUP.md) for setup, trial 
 
 ## Build 5.2.4 — kiosk face-attendance workflow
 
+> Build 5.3.0 adds the Group Visits workflow; see `docs/GROUP-VISIT-WORKFLOW.md`.
+
 The self-service kiosk now offers Student, Staff and Contractor attendance choices, a live browser-webcam capture, an explicit mock/live mode indicator, a returned candidate profile (name, record ID, affiliation and safe Genetec-linked metadata where present), a confirmation step, and a local attendance-session ledger. Mock mode returns scripted synthetic identities and is clearly labelled; it does not perform facial recognition or write to Genetec. Live mode is strictly gated and searches only active, individually approved profiles already linked to a Genetec Cardholder portrait and additional local enrollment samples. It does not yet enumerate and facial-search every raw Genetec Cardholder portrait. The experimental LBPH matcher is not a validated production-grade face identification model. See `docs/KIOSK-FACE-ATTENDANCE.md` and `docs/CHANGE-REQUEST-KIOSK-FACE-ATTENDANCE.md`; the new self-service identification purpose requires signed school safeguarding/privacy approval and a requirements change before real student data is used.
+
+
+## Build 5.3.0 — Group Visits workflow
+
+> Build 5.3.1 adds an SQLite-backed visitor-type catalogue with pre-populated categories, custom type management and a required invitation dropdown. See `docs/VISITOR-TYPES-CATALOGUE.md`.
+
+The Group Visits view adds persistent group bookings with mixed Student/Guardian/Staff/Contractor/Other roster members, booking-scoped opaque QR passes, separate arrival/departure webcam capture metadata, annotated candidate preview, individually confirmed batch attendance and complete roster reconciliation. Mock mode uses clearly labelled scripted candidates; it does not analyse images. Live candidate matching is disabled by default and is scoped to approved individual profiles explicitly linked to the selected booking. Group photos are never enrolled as biometric templates and are not retained by default; optional retention requires explicit approval, expiry and Windows DPAPI protection.
+
+This remains a local prototype without enterprise authentication/RBAC. Use synthetic data only, keep the service loopback-only, and do not enable live biometric matching or photo retention until Stamford signs off the expanded purpose, notices/consent, eligible populations, retention and access policy. The group flow does not implement automatic expected-vs-observed headcount comparison or validated large-group subgroup handling. See [`docs/GROUP-VISIT-WORKFLOW.md`](docs/GROUP-VISIT-WORKFLOW.md), [`docs/CHANGE-REQUEST-GROUP-VISIT.md`](docs/CHANGE-REQUEST-GROUP-VISIT.md), and [`docs/VALIDATION-REPORT-MILESTONE5.3.0-GROUP-VISIT.md`](docs/VALIDATION-REPORT-MILESTONE5.3.0-GROUP-VISIT.md).
+
+
+## Build 5.3.2 — Stamford frontend branding
+
+The provided Stamford American International School logo is now used in the persistent application sidebar, kiosk welcome screen, visitor sticker preview/print, Windows printer test label, group QR print page, and browser favicon. The source logo is stored under `ui/assets/`; a compact transparent crest is cropped from that same asset for the favicon. See [`docs/FRONTEND-BRANDING.md`](docs/FRONTEND-BRANDING.md).
+
+
+## Build 5.4.0 — Reporting and multi-format exports
+
+The Reports & exports workspace runs 17 report types from local data stores: visitor register, inside register, overdue/unresolved visits, daily/visitor-type/host summaries, visitor event log, visitor-type catalogue, group register, group-roster attendance, individual attendance, Genetec sync status, imported Genetec Cardholder roster, SMS delivery log, transactional audit log, and replacement-card and AI-event demo snapshots. Reports can be previewed and exported as CSV, Excel XLSX, JSON, PDF or standalone HTML. Shared filters are available, with date filtering disabled for demo snapshots that do not have reliable dates. Visitor email is excluded by default and can be added only for the Visitor Register.
+
+Exports are server-generated from transactional source records where available, include source limitations, and omit QR tokens, raw credentials, portraits, face samples and group-photo bytes. CSV formula injection is mitigated and XLSX data uses string cells. Preview is capped at 200 rows and exports at 25,000 rows. The reports are operational prototype output, not a tamper-resistant enterprise audit log. See [`docs/REPORTING-EXPORTS.md`](docs/REPORTING-EXPORTS.md).

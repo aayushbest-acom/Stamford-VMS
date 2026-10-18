@@ -1,0 +1,677 @@
+diff --git a/README.md b/README.md
+index 4f9995f..7c54609 100644
+--- a/README.md
++++ b/README.md
+@@ -1,7 +1,7 @@
+ # Stamford VMS Prototype Repository
+ 
+ **Project:** ACOM × Stamford American International School — Visitor Management System
+-**Current milestone:** 5.2.4 — kiosk Student/Staff/Contractor attendance flow with explicit mock/live boundaries
++**Current milestone:** 5.3.0 — group bookings, arrival/departure photo evidence, roster-scoped attendance and human reconciliation
+ **Repository status:** Prototype source, synthetic data, and a loopback-only .NET Framework bridge. Not a production release.
+ 
+ ## What is in this repository
+@@ -154,4 +154,13 @@ See [`docs/INTEGRATIONS-SETUP.md`](docs/INTEGRATIONS-SETUP.md) for setup, trial
+ 
+ ## Build 5.2.4 — kiosk face-attendance workflow
+ 
++> Build 5.3.0 adds the Group Visits workflow; see `docs/GROUP-VISIT-WORKFLOW.md`.
++
+ The self-service kiosk now offers Student, Staff and Contractor attendance choices, a live browser-webcam capture, an explicit mock/live mode indicator, a returned candidate profile (name, record ID, affiliation and safe Genetec-linked metadata where present), a confirmation step, and a local attendance-session ledger. Mock mode returns scripted synthetic identities and is clearly labelled; it does not perform facial recognition or write to Genetec. Live mode is strictly gated and searches only active, individually approved profiles already linked to a Genetec Cardholder portrait and additional local enrollment samples. It does not yet enumerate and facial-search every raw Genetec Cardholder portrait. The experimental LBPH matcher is not a validated production-grade face identification model. See `docs/KIOSK-FACE-ATTENDANCE.md` and `docs/CHANGE-REQUEST-KIOSK-FACE-ATTENDANCE.md`; the new self-service identification purpose requires signed school safeguarding/privacy approval and a requirements change before real student data is used.
++
++
++## Build 5.3.0 — Group Visits workflow
++
++The Group Visits view adds persistent group bookings with mixed Student/Guardian/Staff/Contractor/Other roster members, booking-scoped opaque QR passes, separate arrival/departure webcam capture metadata, annotated candidate preview, individually confirmed batch attendance and complete roster reconciliation. Mock mode uses clearly labelled scripted candidates; it does not analyse images. Live candidate matching is disabled by default and is scoped to approved individual profiles explicitly linked to the selected booking. Group photos are never enrolled as biometric templates and are not retained by default; optional retention requires explicit approval, expiry and Windows DPAPI protection.
++
++This remains a local prototype without enterprise authentication/RBAC. Use synthetic data only, keep the service loopback-only, and do not enable live biometric matching or photo retention until Stamford signs off the expanded purpose, notices/consent, eligible populations, retention and access policy. The group flow does not implement automatic expected-vs-observed headcount comparison or validated large-group subgroup handling. See [`docs/GROUP-VISIT-WORKFLOW.md`](docs/GROUP-VISIT-WORKFLOW.md), [`docs/CHANGE-REQUEST-GROUP-VISIT.md`](docs/CHANGE-REQUEST-GROUP-VISIT.md), and [`docs/VALIDATION-REPORT-MILESTONE5.3.0-GROUP-VISIT.md`](docs/VALIDATION-REPORT-MILESTONE5.3.0-GROUP-VISIT.md).
+diff --git a/Start-Demo.cmd b/Start-Demo.cmd
+index 47b713b..884d212 100644
+--- a/Start-Demo.cmd
++++ b/Start-Demo.cmd
+@@ -1,8 +1,8 @@
+ @echo off
+ setlocal
+ cd /d "%~dp0"
+-echo Starting Stamford VMS prototype - BUILD 5.2.4
+-echo UI updates: explicit visit start/end times, laptop-camera QR scanner, no Day 1/Day 2 banner.
++echo Starting Stamford VMS prototype - BUILD 5.3.0
++echo UI includes secure visitor flows, category attendance kiosk, group photo/roster workflow, and mock/live adapters.
+ echo URL: http://127.0.0.1:8080
+ echo Persistence: local SQLite service with browser fallback.
+ echo QR scanner: browser native detection or local OpenCV frame decoder.
+@@ -37,7 +37,7 @@ goto LAUNCH_END
+ 
+ :PORT_IN_USE
+ echo ERROR: Port 8080 is already in use. A previous VMS instance is likely still running.
+-echo Close the old VMS console, then launch Start-Demo.cmd from this Milestone 5.2.4 folder.
++echo Close the old VMS console, then launch Start-Demo.cmd from this Milestone 5.3.0 folder.
+ echo The launcher stopped here so the older UI cannot silently appear to be the updated build.
+ timeout /t 15 /nobreak >nul
+ exit /b 2
+diff --git a/VERSION.txt b/VERSION.txt
+index 73ce950..03f488b 100644
+--- a/VERSION.txt
++++ b/VERSION.txt
+@@ -1 +1 @@
+-5.2.4
++5.3.0
+diff --git a/docs/CHANGE-REQUEST-GROUP-VISIT.md b/docs/CHANGE-REQUEST-GROUP-VISIT.md
+new file mode 100644
+index 0000000..f319f02
+--- /dev/null
++++ b/docs/CHANGE-REQUEST-GROUP-VISIT.md
+@@ -0,0 +1,37 @@
++# Change Request — Group Visit Photo and Collective Attendance
++
++**Target prototype build:** 5.3.0
++**Source baseline:** 5.2.4 kiosk face-attendance prototype
++**State:** Prototype implementation added; user/policy and target-environment acceptance outstanding.
++
++## Requested business capability
++
++Allow an authorised organiser/operator to create a group visit with multiple students, guardians and other attendees; capture separate group arrival and departure images; associate suggested detections with the booking roster; batch-confirm individually reviewed attendance events; and reconcile missing, obscured or unmatched people.
++
++## Traceability
++
++- **VMS-GRP-001:** Persistent group booking, organiser/host, destination, purpose, school-local visit window, and mixed-person roster.
++- **VMS-GRP-002:** Opaque group QR token, server-side validation, expiry, revocation and rotation. QR is a booking reference, never attendance proof.
++- **VMS-GRP-003 / 005:** Separate arrival/departure scan IDs and UTC capture timestamps, image digest/dimensions, preview and retention gate.
++- **VMS-GRP-004:** Annotated canvas with detection boxes, labels and explicit mock/live indicators.
++- **VMS-GRP-006:** Required complete human roster reconciliation, no checkout-before-check-in, duplicate protection and audit events.
++- **VMS-GRP-007:** Not implemented; requires detector/view validation and signed performance criteria.
++- **VMS-GRP-008:** Site max size, subgroup process and camera framing remain open. The prototype's limit of 100 roster records is only a defensive software cap.
++- **VMS-GRP-009 / SEC-014:** Group photos cannot enroll faces. Existing individually approved profile links are required for live candidate matching.
++
++## Scope and design controls
++
++Mock mode offers scripted candidates for UI rehearsal and does not analyse the image pixels. Live mode uses the approved local face matcher scoped to the exact group booking roster. Each candidate requires a human confirmation. It does not query every raw Genetec Cardholder portrait and does not create a native Genetec attendance object. For linked profiles, the existing separately gated Genetec Custom Event attendance path can be attempted and is marked `raised-unverified` until read-back is confirmed in Security Center.
++
++Photographs remain preview-only by default. Optional local retention requires explicit purpose approval, a defined retention duration, and protection at rest using Windows DPAPI. Identity matching, group photo retention and guardian/minor handling require specific Stamford safeguarding/privacy approval before live deployment.
++
++## Acceptance criteria for a later live pilot
++
++1. Create/read/update test booking and exact roster on the local service; reject duplicate/invalid roster entries and expired/revoked QR passes.
++2. Webcam captures and displays a fresh arrival image and a distinct departure image with UTC timestamp/correlation ID on the selected Windows hardware.
++3. Live detections are restricted to active, approved individual profiles explicitly linked to that booking; unknown, duplicated, low-confidence and obscured people are not auto-attended.
++4. Attendance changes only after an authorised human confirmation. Duplicate events, checkout without check-in, wrong-group tickets and partial reconciliation are rejected.
++5. Evidence retention is preview-only unless a signed schedule enables protected, expiring Windows storage. Verify expiry and no group-image enrollment.
++6. Genetec native Custom Events, where enabled, are independently read back in Security Center. A bridge submission response alone is insufficient.
++7. Measure false matches, missed detections and performance for the agreed sample, view, lighting, group size and device. Sign off each supported condition separately.
++8. Enforce approved authentication/RBAC, audit permissions, operational retention and accessibility/site requirements before real personal data is processed.
+diff --git a/docs/GROUP-VISIT-WORKFLOW.md b/docs/GROUP-VISIT-WORKFLOW.md
+new file mode 100644
+index 0000000..b3031e2
+--- /dev/null
++++ b/docs/GROUP-VISIT-WORKFLOW.md
+@@ -0,0 +1,63 @@
++# Group Visits — Build 5.3.0
++
++## Scope delivered in the prototype
++
++The Group Visits view now owns the booking and roster through the complete demonstration flow:
++
++1. Create a booking with organisation, organiser, Stamford host, destination, purpose and visit window.
++2. Add multiple roster members. Supported categories are Student, Guardian, Staff, Contractor and Other. The optional `guardianOf` field associates a guardian with a named student; an optional `faceProfileId` can link only an already active, approved individual enrollment of the same category.
++3. Issue or rotate an opaque group QR pass. The service persists only the SHA-256 token digest. A group QR resolves the booking only; it does not identify a person or mark attendance.
++4. Start the local webcam, capture a fresh arrival image and render a photo preview with candidate bounding boxes/labels.
++5. In mock mode, scripted candidates and boxes support demonstrations but do not represent facial recognition. The result and confirmation screen clearly label this.
++6. In live mode, matching is gated and uses only approved, individually enrolled profiles explicitly attached to this booking roster. A suggested candidate must be selected and human-confirmed. Unmatched, obscured or duplicate face candidates require manual reconciliation; there is no mock fallback when live matching is blocked.
++7. Repeat with a fresh departure capture. A member cannot be checked out until that member has a recorded check-in.
++8. Reconcile every roster member with an explicit disposition. The API rejects partial reconciliation and prevents a member with recorded attendance from being marked absent.
++
++## API routes
++
++- `GET /api/v1/group-visits/status`
++- `GET /api/v1/group-visits`
++- `GET /api/v1/group-visits/{groupEventId}`
++- `POST /api/v1/group-visits`
++- `POST /api/v1/group-visits/qr/validate`
++- `POST /api/v1/group-visits/qr/svg`
++- `POST /api/v1/group-visits/{groupEventId}/qr/rotate`
++- `POST /api/v1/group-visits/{groupEventId}/roster`
++- `POST /api/v1/group-visits/{groupEventId}/scan`
++- `POST /api/v1/group-visits/{groupEventId}/confirm`
++- `POST /api/v1/group-visits/{groupEventId}/reconcile`
++
++Times in the booking are interpreted in Stamford school time (`Asia/Singapore`, UTC+08:00). The current 100-person roster cap and configured face-detection cap are prototype safety limits, not approved site capacity commitments.
++
++## Configuration
++
++- `STAMFORD_GROUP_VISIT_MODE=mock` is the default. Set to `live` only for approved live testing.
++- Live matching additionally requires `STAMFORD_FACE_ATTENDANCE_ENABLED=1`, `STAMFORD_BIOMETRIC_POLICY_APPROVED=1`, and `STAMFORD_GROUP_FACE_IDENTIFICATION_APPROVED=1`, plus Windows DPAPI, the supported OpenCV-contrib face module, and the required individual profile samples.
++- Genetec attendance-event submission has its own independent controls: `STAMFORD_GENETEC_ATTENDANCE_EVENT_SYNC_ENABLED=1` and `STAMFORD_GENETEC_ATTENDANCE_EVENT_SYNC_APPROVED=1`, as well as configured bridge/custom-event mapping. A `raised-unverified` result is not read-back proof; verify the corresponding event in the actual Genetec Directory.
++- `STAMFORD_GROUP_PHOTO_RETENTION_APPROVED=1` and an approved `STAMFORD_GROUP_PHOTO_RETENTION_DAYS` between 1 and 3650 are required before the service stores photo bytes. On Windows, stored bytes are protected with DPAPI. The default is preview-only: the database stores capture timestamp, dimensions and SHA-256 digest, not the raw photo.
++
++Do not turn on live biometric matching or retained group photographs until Stamford has approved the purpose, applicable notices/consent, eligible populations, retention schedule, access controls and fallback policy.
++
++## Safety and limitations
++
++- A group photograph is never used to create or update a biometric enrollment/template. Only previously enrolled profiles can be candidates.
++- Live identity candidates are roster-scoped; this is not an unrestricted one-to-many search through every raw Genetec Cardholder portrait.
++- Mock mode makes no recognition claim and does not write to Genetec.
++- Live attendance is recorded in the prototype ledger and may emit the existing Genetec Custom Event outbox for linked Cardholders when that independently approved path is enabled. It is not a native Genetec attendance object; `raised-unverified` requires event read-back in Security Center.
++- The application has no enterprise authentication or RBAC. Keep it loopback-only and use synthetic data until security work is accepted.
++- SRS VMS-GRP-007 headcount comparison and the large-group camera/subgroup acceptance under VMS-GRP-008 are not implemented/validated. Do not treat a face-detection count as proof of who attended.
++
++## Demonstration procedure
++
++1. Start `Start-Demo.cmd` and open `http://127.0.0.1:8080`.
++2. Select **Group visits → New group booking**. Enter the visit details and add one person per line, e.g.:
++   - `Student | Ava Reed | STU-DEMO-01 | Grade 6A`
++   - `Guardian | Olivia Reed | GDN-DEMO-01 | Parent | Ava Reed`
++   - `Staff | Jordan Chen | STAFF-DEMO-02 | Visiting teacher`
++3. Open **Photo + attendance**. In default mock mode, start the webcam, capture and match, select the scripted demo candidates, acknowledge the explicit confirmation text and confirm. This demonstrates the workflow only, not recognition accuracy.
++4. Choose **Collective check-out**, capture a new image and confirm the test candidates. For a partial group, use **Reconcile full roster** and explicitly disposition all people.
++5. For live testing, obtain the privacy/purpose approval, individually enroll eligible profiles, link their exact profile IDs to the booking, enable required gates and use a Windows test workstation. Start with synthetic or specifically approved test subjects and verify Genetec events independently.
++
++## Regression checks
++
++Run `python -m unittest discover -s tests -v`, compile the modified Python files with `python -m py_compile service/group_visits.py service/face_attendance.py service/vms_service.py`, and extract the inline UI script to run `node --check`. Target Windows/webcam/DPAPI/OpenCV/Genetec acceptance is additional to these automated checks.
+diff --git a/docs/REQUIREMENTS-TRACEABILITY.csv b/docs/REQUIREMENTS-TRACEABILITY.csv
+index fcb6ce0..ddb2344 100644
+--- a/docs/REQUIREMENTS-TRACEABILITY.csv
++++ b/docs/REQUIREMENTS-TRACEABILITY.csv
+@@ -57,55 +57,55 @@ SEC-010,Blocked by policy approval,No biometric purpose/notice/consent approval
+ SEC-011,Partial — demo alternatives,QR and staff-assisted concepts exist; safe identity-verification fallback is not tested.,Implement and test alternative identity paths without weakening access approval.
+ SEC-012,Not verified,"No continuous identity-tracking feature is apparent, but no signed data-flow/configuration review exists.",Document prohibited processing and verify through design/configuration/privacy review.
+ SEC-013,Partial — human review intent,UI language places human review over sample AI events.,Enforce human authorization in backend workflows and prove AI-only release/discipline actions impossible.
+-SEC-014,Not demonstrated end to end,"No group biometric enrolment function exists, but policy tests are absent.",Add design/configuration/data tests that group photos are not converted to templates by default.
++SEC-014,Implemented in prototype — formal privacy acceptance pending,Group capture and match routes do not call any enrollment operation; live suggestions are limited to already-enrolled profile IDs explicitly linked to the booking roster.,"Complete security/privacy design review and target-host tests, including evidence that no group image or detected face is converted into a template."
+ VMS-INV-001,Partial — demo/local,"Invitation form captures name, contact, host, destination, date/window and local record.","Add authenticated host identity, central domain API and approved field validation; exercise acceptance tests."
+ VMS-VIS-001,Partial — server-side QR validation plus explicit school-local visit-window logic,"Secure random token/hash lookup, revocation/expiry checks and transactional check-in/out remain. The domain API now compares visit date/time against Asia/Singapore (UTC+08:00), independent of the host OS timezone; validation returns server school time and allowed interval for diagnosing rejections.","Test real webcam scans on the target Windows browser for valid, unknown, expired, revoked, before-window, within-window, and after-window cases; complete authenticated roles and approved staff-assisted fallback."
+ VMS-PRN-001,Partial — unapproved template,Sticker preview contains visitor/host/destination/time and sample QR reference.,Stamford to approve design and exact required fields; test on production template.
+ VMS-CARD-001,Partial — simulated form/state,Replacement request list and sample ID/name/class fields exist.,Connect to central API and approved identity/eligibility source; enforce validation and permissions.
+-VMS-GRP-001,Partial — demo/local,Group booking/QR concepts and synthetic rosters exist.,"Central persistence, secure group token, booking validation and policy validation."
++VMS-GRP-001,Partial — server-backed prototype,"Persistent booking and roster API captures organisation, organiser/host, destination, purpose, school-local visit window and mixed Student/Guardian/Staff/Contractor/Other roster members.","Complete authenticated roles, approved field catalogue/capacity, migration/source-of-truth decisions, and target-host acceptance."
+ VMS-UX-001,Partial — prototype branding,Stamford identity appears in the UI.,Obtain brand/design sign-off for deployed production screens.
+ VMS-INV-002,"Partial — explicit date/start/end fields, school-local timezone policy implemented; date defaults to today","Invitation UI uses separate required start/end fields with step=60; new invitations default to today in Asia/Singapore school time, and active invited server-backed visits can amend date/window. Server stores normalized HH:MM–HH:MM and interprets dates/times in the same explicit UTC+08:00 timezone.","Complete target Windows/browser UAT for arbitrary minute values, same-day default and dates near local midnight; approve required fields/time policy, authenticated host identity and acceptance thresholds."
+ VMS-VIS-002,Partial — transactional local domain API,"Check-in transition is persisted transactionally with UTC timestamp, stable event ID, prior/new state and server-side prototype audit record; Genetec-linked secure kiosk events now create a separate lifecycle-sync event from the server timestamp.","Add authenticated actor identity, tamper-resistant audit, role checks and fresh Windows/Genetec end-to-end correlation evidence."
+ VMS-PRN-002,Partial — unapproved template,Sticker preview contains visitor/host/destination/time and sample QR reference.,Stamford to approve design and exact required fields; test on production template.
+ VMS-CARD-002,Partial — simulated form/state,Replacement request list and sample ID/name/class fields exist.,Connect to central API and approved identity/eligibility source; enforce validation and permissions.
+-VMS-GRP-002,Partial — demo/local,Group booking/QR concepts and synthetic rosters exist.,"Central persistence, secure group token, booking validation and policy validation."
++VMS-GRP-002,Partial — opaque server-backed QR,"Booking creation returns a short-lived opaque token once; database stores SHA-256 only, supports validation/rotation/revocation, and QR explicitly does not authorise attendance.",Verify expired/cancelled/replayed token cases on target browser/devices; secure the endpoint with approved authentication/rate limiting before real data.
+ VMS-UX-002,Partial — guided front-end workflow with camera scanner,Visitor invitation uses explicit start/end time selection; kiosk supports native or local OpenCV-backed camera QR decoding and visible manual-entry fallback.,"Complete task-based UAT for visitor/check-out/card flows, camera denial, missing decoder, accessible fallback and focus/lighting conditions."
+ VMS-INV-003,Partial — local synthetic amendment API/UI implemented; production authorization pending,"Visit details offers Edit visit date/time for active invited server-backed visits. POST /api/v1/visits/{bookingId}/amend validates date/window, preserves an active QR token, recalculates expiry, updates row version, and appends a before/after audit event. Linked Genetec schedules must be explicitly re-synced.",Implement authenticated host authorization for production; verify amendment propagation/read-back against Genetec on target Windows host; exercise cancel/expiry/concurrency exceptions in UAT.
+ VMS-VIS-003,Partial — browser/Windows print path,Visitor sticker preview and `window.print()` invoke the native browser/Windows print dialog. A separate synthetic print test is available in Integrations & devices; physical output and printer-failure handling have not been verified.,"Validate the approved printer, driver, sticker layout/QR and required fields on Windows; test paper-out/offline/retry and staff-assisted fallback; implement a protected print bridge if unattended printing is required."
+ VMS-PRN-003,Partial — native browser-to-Windows print path,"The UI opens the system print dialog, which can route to an installed Windows printer. This is not direct spooler integration and does not prove output.","Run end-to-end print tests on the target Windows device/printer and document model, driver, paper/label size and deployment mode; build an approved local print bridge if required."
+ VMS-CARD-003,Not implemented,No real face matching or liveness implementation is included.,"Only after school approval: validated local biometric/liveness provider, child-height tests, threshold evidence and privacy controls."
+-VMS-GRP-003,Not implemented — placeholder only,Arrival/departure notes explicitly state that no live group photo is captured.,"Camera integration, separate arrival/departure photo and UTC timestamp storage, preview, access control and retention."
++VMS-GRP-003,Partial — live webcam capture and timestamp metadata,"Group Visits captures a fresh arrival frame, sends it to local service, records UTC timestamp/dimensions/hash, and optionally retains a separately protected copy only behind explicit retention approval.","Exercise real webcam and camera positioning on the approved kiosk; decide whether photo evidence must persist, approve retention, and verify protected retention/deletion on Windows."
+ VMS-UX-003,Partial — live browser camera and print demonstrated in code; target matrix pending,"Kiosk QR camera path remains; the Integrations & devices panel can enumerate/select a webcam, start a live browser feed and capture an in-memory preview. Browser print can open the Windows print dialog. Dedicated kiosk and managed-iPad equivalence remain unverified.","Verify Edge/Chrome versions, camera permissions, camera framing, Windows printer workflow and supported kiosk/iPad combinations on actual target hardware."
+ VMS-INV-004,Partial — demo/local,Invited records can be cancelled in browser state.,Persist cancellation as a server-side transition; revoke/expire token and sync to Genetec with read-back.
+ VMS-VIS-004,Partial — server-side secure pass flow,"Kiosk submits the opaque token to the domain API; token hash, revocation, expiry, booking window, current state and idempotent event ID are validated. Time-window strings are normalized before native Genetec sync.",Verify physical scanner/device and manual fallback; prove no duplicate VMS/Genetec side effects in the target environment.
+ VMS-PRN-004,Not implemented,No paper-out/offline/retry workflow demonstrated.,"Add print-health/error handling, no-duplicate retry and staff-assisted fallback tests."
+ VMS-CARD-004,Partial — status simulation,Counter queue states and exception/collection UI actions are represented.,Server-side workflow and authorised actions; durable collector/actor and timestamps; negative tests.
+-VMS-GRP-004,Not implemented — placeholder only,Arrival/departure notes explicitly state that no live group photo is captured.,"Camera integration, separate arrival/departure photo and UTC timestamp storage, preview, access control and retention."
++VMS-GRP-004,Partial — photo preview and roster annotations,"Kiosk displays the captured image on an annotated canvas with candidate boxes, person labels and explicit simulated/live markers.",Complete operator usability/accessibility tests and confirm every suggested association is reviewed; verify real CV boxes/matching with approved roster samples.
+ VMS-UX-004,Not verified,No on-site camera framing/accessibility survey evidence.,"Site survey and recorded child/adult height, reach, lighting, noise and route tests."
+ VMS-INV-005,Implemented in local prototype API; production approval pending,POST /api/v1/visits issues a random 256-bit opaque token; POST /api/v1/qr/svg renders a dynamic QR using the token.,Add SMS/invitation delivery; approve policy and conduct target-environment threat/security testing.
+ VMS-VIS-005,Partial — local domain transition; Genetec remains separate,"Checkout state and UTC timestamp commit to SQLite with a stable event ID and exact-retry handling. For a Genetec-linked secure visit, the UI now creates an explicit lifecycle-sync event using the server-returned timestamp; it does not silently mutate Genetec. Build 5.1.6 now directs an unsynced CheckIn before a failed local Checkout can be retried.",Complete fresh-host Genetec lifecycle read-back and implement approved durable synchronization/outbox/reconciliation. Complete target-host round-trip; validate both original events and no duplicate state transitions.
+ VMS-CARD-005,Not implemented / decision required,No verified eligibility rule engine or secure auto-approval path.,Obtain written policy decision; implement allow-listed criteria and audit configuration changes if enabled.
+-VMS-GRP-005,Not implemented — placeholder only,Arrival/departure notes explicitly state that no live group photo is captured.,"Camera integration, separate arrival/departure photo and UTC timestamp storage, preview, access control and retention."
++VMS-GRP-005,Partial — separate departure capture implemented,Checkout requires group arrival and records a distinct departure scan/photo hash/timestamp; individual checkout is rejected unless the member has recorded check-in.,"Target-device acceptance, approved evidence retention, full group lifecycle verification and Genetec read-back remain pending."
+ VMS-UX-005,Not implemented end to end,No live voice/intercom or restricted approved contact workflow is demonstrated.,Implement only if selected; integrate approved directory/telephony and test allow-list/fallback behavior.
+ VMS-INV-006,Partial — mock and gated live SMS adapter implemented,"The UI can send test/invitation messages through a persistent SQLite mock outbox; Vonage/Twilio REST adapters are implemented behind provider credentials and an exact recipient allow-list. Twelve adapter tests cover provider request contracts, idempotency, failure handling and invitation-link gates; no real provider delivery has been verified.","Run a live provider test to a verified allow-listed destination; check provider delivery status, approve message wording/egress, and implement/deploy an approved HTTPS visitor-pass page before enabling live invitation links."
+ VMS-VIS-006,Partial — domain visit records available,Server-backed records and their current status are loaded into the visitor register; check-in/out status is authoritative in the local domain table for secure visits.,"Implement overdue scheduler/escalation, register scope/filtering, operational reconciliation and role-scoped visibility."
+ VMS-CARD-006,Partial — status simulation,Counter queue states and exception/collection UI actions are represented.,Server-side workflow and authorised actions; durable collector/actor and timestamps; negative tests.
+-VMS-GRP-006,Partial — human confirmation UI,A human disposition modal requires a note for complete reconciliation.,Per-attendee status and evidence model; prevent closure while any attendee is missing/obscured or unresolved.
++VMS-GRP-006,Partial — explicit full-roster reconciliation implemented,"Server requires one explicit disposition for every roster member, prevents absent-after-attendance conflicts, blocks invalid checkout transitions, and leaves unresolved/obscured people open for human resolution.","Exercise UAT with missing, obscured, late and partially departing attendees; enforce approved role permissions and retain sign-off/audit evidence."
+ VMS-UX-006,Partial — manual fallback implemented; operational tests pending,"If native QR detection/camera access is unavailable, the UI offers manual pass-token entry. Camera is released on kiosk reset/navigation.","Exercise camera blocked, unsupported BarcodeDetector, token rejection, QR expiry, printer/network/Genetec failure, and staff-assisted recovery paths."
+ VMS-INV-007,Implemented in local prototype API; production approval pending,Cryptographically random token; server stores SHA-256 hash only; raw token omitted from localStorage/SQLite snapshot; rotation and cancellation revoke previous token.,"Add application authentication/authorization, rate limits and approved security review; test expiry/replay/rotation on supported devices."
+ VMS-VIS-007,Partial — visit timing and window checks implemented; overdue policy workflow incomplete,The domain API uses the explicit school timezone for the booked window and supports a 30-minute early check-in allowance plus a 60-minute post-end allowance; error responses expose school-local time and bounds.,"Agree and test the school-approved grace/escalation policy, overdue alerts, audit and missed-checkout reconciliation in the end-to-end pilot."
+ VMS-CARD-007,Partial — status simulation,Counter queue states and exception/collection UI actions are represented.,Server-side workflow and authorised actions; durable collector/actor and timestamps; negative tests.
+-VMS-GRP-007,Not implemented / validation needed,No verified headcount detector or large-group camera handling.,"Pilot count comparison and group-size framing/subgroup test plans, with limitations recorded."
++VMS-GRP-007,Not implemented — optional / validation required,No automatic observed-versus-expected headcount comparison is claimed; candidate face count is not represented as proof of identity or departure.,Only add count comparison after detector/view validation with agreed false/missed mismatch results and documented limitations.
+ VMS-UX-007,Not verified,No on-site camera framing/accessibility survey evidence.,"Site survey and recorded child/adult height, reach, lighting, noise and route tests."
+ VMS-INV-008,Not implemented,A local audit entry can be created; no real notification is sent.,"Implement approved host notification adapter, retry/status handling and acceptance tests."
+ VMS-VIS-008,Not implemented end to end,An overdue demo scenario can be created manually; no scheduler/notification/escalation service.,"Implement configured 30–60 minute policy, scheduled processing, host notification, security escalation and duplicate-safe retries."
+ VMS-CARD-008,Not implemented,No credential revocation/activation integration is evidenced.,Implement approved native credential lifecycle with order-of-operations and read-back proving old credential revoked before replacement activation.
+-VMS-GRP-008,Not implemented / validation needed,No verified headcount detector or large-group camera handling.,"Pilot count comparison and group-size framing/subgroup test plans, with limitations recorded."
++VMS-GRP-008,Partial — prototype guardrails only; site capacity open,"Prototype limits a booking to 100 people and live face detections to the configured detector maximum. These are technical safeguards, not approved Stamford capacity commitments; sequential subgroup flow/camera framing remain to validate.","Jointly agree maximum group size, subgroup procedures, camera positioning, accessibility and large-group test results before acceptance."
+ VMS-UX-008,Not implemented end to end,No live voice/intercom or restricted approved contact workflow is demonstrated.,Implement only if selected; integrate approved directory/telephony and test allow-list/fallback behavior.
+ VMS-INV-009,Partial — server-side secure pass validation,"Secure token is looked up server-side; token expiry/revocation, booking status and check-in window are enforced by transactional API before transition.","Confirm final policy rules, cancellation synchronization and production role authorization; test tamper/replay/duplicate/expired cases in UAT."
+ VMS-VIS-009,Not implemented end to end,An overdue demo scenario can be created manually; no scheduler/notification/escalation service.,"Implement configured 30–60 minute policy, scheduled processing, host notification, security escalation and duplicate-safe retries."
+ VMS-CARD-009,Not verified,Local prototype storage does not establish the full end-to-end data-flow boundary for identity/face data.,Approve architecture and verify no unapproved data egress before any real identity data is used.
+-VMS-GRP-009,Not demonstrated end to end,No biometric enrolment workflow exists in this prototype.,Add explicit configuration/data tests proving group images are never enrolled as biometric templates by default.
++VMS-GRP-009,Implemented in prototype — acceptance review pending,"Group scanning code never enrolls from group photos; active faceProfileId links must already exist, be approved and match the roster member category. Regression tests assert group-image enrolment is blocked.",Review configuration/data flows and verify on the Windows target; obtain school safeguarding/privacy approval before live biometric matching.
+ VMS-VIS-010,Not implemented,No host-confirmed extension workflow found.,"Implement permitted extension approval, audit and supported access-window sync."
+ VMS-VIS-011,Not implemented for visitors,Group roster reconciliation exists as a separate demo interaction; missed visitor checkout reconciliation is absent.,"Implement authorised reconciliation with reason, actor, prior state and audit trail."
+ VMS-VIS-012,Partially represented,UI labels transactions as demo/local; occupancy semantics are not comprehensively acceptance-tested.,Explicitly label register as recorded check-in minus check-out; never represent it as verified physical occupancy.
+diff --git a/docs/VALIDATION-REPORT-MILESTONE5.3.0-GROUP-VISIT.md b/docs/VALIDATION-REPORT-MILESTONE5.3.0-GROUP-VISIT.md
+new file mode 100644
+index 0000000..e13de28
+--- /dev/null
++++ b/docs/VALIDATION-REPORT-MILESTONE5.3.0-GROUP-VISIT.md
+@@ -0,0 +1,35 @@
++# Validation Report — Build 5.3.0 Group Visits
++
++## Scope checked
++
++Added booking-owned group visit state, mixed-person roster entry, opaque group QR token/rotation, live webcam capture API, per-scan image metadata and timestamp, optional protected photo retention, roster-scoped face candidate matching, annotated photo preview, explicit human batch confirmation, per-member attendance state, full-roster reconciliation and UI navigation through Group Visits.
++
++## Automated checks
++
++Run from the repository root:
++
++```powershell
++python -m py_compile service/group_visits.py service/face_attendance.py service/vms_service.py
++python -m unittest discover -s tests -v
++python -c "from pathlib import Path; s=Path('ui/index.html').read_text(encoding='utf-8'); Path('inline-ui-check.js').write_text(s[s.index('<script>')+8:s.rfind('</script>')],encoding='utf-8')"
++node --check inline-ui-check.js
++Remove-Item inline-ui-check.js
++```
++
++Final validation for this patch set:
++
++- `python -m py_compile service/group_visits.py service/face_attendance.py service/vms_service.py tests/test_group_visits.py tests/test_repository_contracts.py` — passed.
++- Inline browser JavaScript extraction followed by `node --check` — passed.
++- `python -m unittest discover -s tests -v` — **111 tests passed, 0 failures**.
++- `git diff --check` — passed; Git emitted only the expected line-ending notice for `Start-Demo.cmd` (LF will be normalised to CRLF by Git on Windows).
++
++These checks validate the source patch and automated local contracts. They do not replace target-Windows webcam, DPAPI, OpenCV-contrib, browser, or Genetec SDK/Directory acceptance. Re-run the checks after applying the patches to the intended working tree.
++
++## Known acceptance boundaries
++
++- Default `STAMFORD_GROUP_VISIT_MODE=mock`: roster candidate names and boxes are scripted. The captured image is not used for identity recognition; the UI explicitly labels the result.
++- Live matching requires the separate group-identity approval and existing face-attendance/policy/Windows DPAPI/OpenCV gates. It is roster-scoped to active individual profiles linked to this group.
++- Group photos are never enrolled as face templates. Raw group photos are not retained by default. Optional retention requires an explicit gate plus approved expiry and DPAPI-protected storage on Windows.
++- The current 100-person roster cap is a prototype guardrail, not a final capacity requirement. Automatic count comparison and large-group sequential subgroup handling remain open.
++- No enterprise application authentication/RBAC is present; loopback and synthetic data only.
++- This Linux/development execution cannot prove a real webcam, Windows DPAPI, OpenCV-contrib recognition quality or the installed Genetec SDK/server. Those are target-host/pilot tests, not unit-test claims.
+diff --git a/tests/test_face_attendance.py b/tests/test_face_attendance.py
+index 1114eb3..08cb1f4 100644
+--- a/tests/test_face_attendance.py
++++ b/tests/test_face_attendance.py
+@@ -74,6 +74,8 @@ class FaceAttendanceTests(unittest.TestCase):
+         self.gate_patch.start()
+         self.extract_patch = patch("service.face_attendance._extract_faces", side_effect=self.fake_extract)
+         self.extract_patch.start()
++        self.group_extract_patch = patch("service.face_attendance._extract_faces_with_boxes", side_effect=self.fake_extract_with_boxes)
++        self.group_extract_patch.start()
+         self.cv_patch = patch("service.face_attendance._opencv_module", return_value=(_FakeCV(), _FakeNumpy()))
+         self.cv_patch.start()
+         self.decode_patch = patch("service.face_attendance._decode_crop", side_effect=lambda data: data)
+@@ -81,7 +83,7 @@ class FaceAttendanceTests(unittest.TestCase):
+         self._fake_counter = 0
+ 
+     def tearDown(self):
+-        for p in (self.decode_patch, self.cv_patch, self.extract_patch, self.gate_patch, self.feature_flags):
++        for p in (self.decode_patch, self.cv_patch, self.group_extract_patch, self.extract_patch, self.gate_patch, self.feature_flags):
+             p.stop()
+         self.temp.cleanup()
+ 
+@@ -92,6 +94,11 @@ class FaceAttendanceTests(unittest.TestCase):
+             raise FaceAttendanceError(422, "TOO_MANY_FACES", "multiple faces")
+         return [b"individual-face-crop"]
+ 
++    def fake_extract_with_boxes(self, data_url, max_faces=40, group_workflow=False):
++        if data_url != "group-frame":
++            raise FaceAttendanceError(400, "INVALID_IMAGE", "unexpected fake group input")
++        return ([{"faceIndex": 1, "cropBytes": b"crop-a", "boundingBox": {"x": 10, "y": 20, "width": 40, "height": 40}}, {"faceIndex": 2, "cropBytes": b"crop-b", "boundingBox": {"x": 70, "y": 20, "width": 40, "height": 40}}], 640, 480)
++
+     def payload(self, student_id):
+         return {
+             "studentId": student_id,
+diff --git a/tests/test_group_visits.py b/tests/test_group_visits.py
+new file mode 100644
+index 0000000..004ff1a
+--- /dev/null
++++ b/tests/test_group_visits.py
+@@ -0,0 +1,290 @@
++"""Tests for persistent group bookings, roster scoping, captures and batch attendance."""
++import base64
++import json
++import os
++import tempfile
++import threading
++import unittest
++from pathlib import Path
++from urllib.error import HTTPError
++from urllib.request import Request, urlopen
++from http.server import ThreadingHTTPServer
++from unittest.mock import patch
++
++from service.group_visits import GroupVisitError, GroupVisitStore
++from service.vms_service import StateStore, make_handler
++from service.domain import DomainStore
++from service.face_attendance import FaceAttendanceStore
++
++
++def image_data(raw=b"synthetic-demo-image"):
++    return "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii")
++
++
++def booking_payload(group_id="GR-TEST001"):
++    return {
++        "groupEventId": group_id,
++        "organizationName": "Demo Visiting School",
++        "organiserName": "Taylor Coach",
++        "hostName": "Morgan Lee",
++        "destination": "Science Centre",
++        "purpose": "Robotics exchange visit",
++        "startsAtLocal": "2026-10-18T09:30",
++        "endsAtLocal": "2026-10-18T12:00",
++        "rosterMembers": [
++            {"personType": "Student", "displayName": "Ava Reed", "externalId": "STU-DEMO-01", "affiliation": "Grade 6A"},
++            {"personType": "Guardian", "displayName": "Olivia Reed", "externalId": "GDN-DEMO-01", "affiliation": "Parent", "guardianOf": "Ava Reed", "contactHint": "ending 1122"},
++            {"personType": "Other", "displayName": "Visiting Interpreter", "affiliation": "Interpreter"},
++        ],
++    }
++
++
++class GroupVisitStoreTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.path = Path(self.temp.name) / "face.sqlite3"
++        self.store = GroupVisitStore(self.path, protector=lambda raw, desc: b"encrypted:" + raw, unprotector=lambda raw: raw.removeprefix(b"encrypted:"))
++
++    def tearDown(self):
++        self.temp.cleanup()
++
++    def test_create_group_with_students_guardians_and_other_details(self):
++        group = self.store.create_booking(booking_payload())
++        self.assertEqual(group["expectedCount"], 3)
++        self.assertEqual([x["personType"] for x in group["roster"]], ["Student", "Guardian", "Other"])
++        self.assertEqual(group["roster"][1]["guardianOf"], "Ava Reed")
++        self.assertEqual(group["status"], "Expected")
++
++    def test_create_rejects_invalid_window_duplicate_ids_and_oversize_roster(self):
++        payload = booking_payload()
++        payload["endsAtLocal"] = payload["startsAtLocal"]
++        with self.assertRaises(GroupVisitError) as ctx:
++            self.store.create_booking(payload)
++        self.assertEqual(ctx.exception.code, "INVALID_VISIT_WINDOW")
++        self.store.create_booking(booking_payload())
++        with self.assertRaises(GroupVisitError) as ctx:
++            self.store.create_booking(booking_payload())
++        self.assertEqual(ctx.exception.code, "GROUP_BOOKING_ALREADY_EXISTS")
++        payload = booking_payload("GR-TEST002")
++        payload["rosterMembers"] = payload["rosterMembers"] * 40
++        with self.assertRaises(GroupVisitError) as ctx:
++            self.store.create_booking(payload)
++        self.assertEqual(ctx.exception.code, "INVALID_ROSTER")
++
++    def test_group_qr_is_opaque_hash_only_and_rotation_revokes_old_pass(self):
++        payload = booking_payload("GR-QRTEST1")
++        payload["startsAtLocal"] = "2026-10-19T09:30"
++        payload["endsAtLocal"] = "2026-10-19T12:00"
++        created = self.store.create_booking(payload)
++        raw_token = created["groupQrToken"]
++        self.assertNotIn("groupQrToken", self.store.get_booking("GR-QRTEST1"))
++        self.assertTrue(self.store.get_booking("GR-QRTEST1")["qrPassAvailable"])
++        verified = self.store.validate_qr(raw_token)
++        self.assertTrue(verified["valid"])
++        self.assertEqual(verified["groupEventId"], "GR-QRTEST1")
++        self.assertFalse(verified["groupQrAuthorisesAttendance"])
++        with self.store._connect() as conn:
++            saved = conn.execute("SELECT token_hash FROM group_qr_tokens WHERE group_event_id=?", ("GR-QRTEST1",)).fetchone()[0]
++        self.assertNotEqual(saved, raw_token)
++        rotated = self.store.rotate_qr("GR-QRTEST1")
++        self.assertNotEqual(rotated["groupQrToken"], raw_token)
++        with self.assertRaises(GroupVisitError) as ctx:
++            self.store.validate_qr(raw_token)
++        self.assertEqual(ctx.exception.code, "GROUP_QR_REVOKED")
++        self.assertTrue(self.store.validate_qr(rotated["groupQrToken"])["valid"])
++
++    def test_reconciliation_requires_full_roster_and_cannot_mark_attendee_absent_after_checkin(self):
++        self.store.create_booking(booking_payload())
++        with patch.dict(os.environ, {"STAMFORD_GROUP_VISIT_MODE": "mock"}, clear=True):
++            scan = self.store.create_scan("GR-TEST001", {"eventType": "CheckIn", "imageData": image_data(), "imageWidth": 640, "imageHeight": 480}, mode="mock")
++        candidates = self.store.mock_match_result("GR-TEST001", scan, 640, 480)["candidates"]
++        self.store.update_scan_match(scan["scanId"], {"candidates": candidates, "simulated": True, "mode": "mock"})
++        self.store.confirm_mock_scan("GR-TEST001", {"scanId": scan["scanId"], "eventType": "CheckIn", "operator": "Test Operator", "confirmBatch": True, "confirmations": [{"ticketId": candidates[0]["ticketId"], "memberId": candidates[0]["memberId"], "confirmMatch": True}]})
++        roster = self.store.get_booking("GR-TEST001")["roster"]
++        with self.assertRaises(GroupVisitError) as ctx:
++            self.store.reconcile("GR-TEST001", {"operator": "Test Operator", "reason": "partial review", "decisions": [{"memberId": roster[0]["memberId"], "disposition": "CheckedIn"}]})
++        self.assertEqual(ctx.exception.code, "ROSTER_RECONCILIATION_INCOMPLETE")
++        with self.assertRaises(GroupVisitError) as ctx:
++            self.store.reconcile("GR-TEST001", {"operator": "Test Operator", "reason": "reviewed", "decisions": [{"memberId": roster[0]["memberId"], "disposition": "Absent"}, {"memberId": roster[1]["memberId"], "disposition": "Unresolved"}, {"memberId": roster[2]["memberId"], "disposition": "Unresolved"}]})
++        self.assertEqual(ctx.exception.code, "ATTENDANCE_ALREADY_RECORDED")
++
++    def test_status_defaults_to_mock_and_reports_biometric_enrolment_disabled_for_group_photos(self):
++        with patch.dict(os.environ, {}, clear=True):
++            status = self.store.status()
++        self.assertEqual(status["mode"], "mock")
++        self.assertFalse(status["liveFaceMatchingApprovalFlag"])
++        self.assertFalse(status["groupPhotoUsedForEnrollment"])
++        self.assertTrue(status["humanConfirmationRequired"])
++        self.assertEqual(status["photoRetention"]["status"], "preview-only")
++
++    def test_confirmed_scan_is_readable_after_review_ttl_but_unconfirmed_scan_expires(self):
++        self.store.create_booking(booking_payload())
++        with patch.dict(os.environ, {"STAMFORD_GROUP_VISIT_MODE": "mock"}, clear=True):
++            scan = self.store.create_scan("GR-TEST001", {"eventType": "CheckIn", "imageData": image_data(), "imageWidth": 640, "imageHeight": 480}, mode="mock")
++        with self.store._connect() as conn:
++            conn.execute("UPDATE group_visit_scans SET expires_at_utc='2000-01-01T00:00:00.000Z',scan_status='Confirmed' WHERE scan_id=?", (scan["scanId"],))
++        self.assertEqual(self.store.get_scan("GR-TEST001", scan["scanId"])["scanStatus"], "Confirmed")
++        with self.store._connect() as conn:
++            conn.execute("UPDATE group_visit_scans SET scan_status='Captured' WHERE scan_id=?", (scan["scanId"],))
++        with self.assertRaises(GroupVisitError) as ctx:
++            self.store.get_scan("GR-TEST001", scan["scanId"])
++        self.assertEqual(ctx.exception.code, "GROUP_SCAN_EXPIRED")
++
++    def test_photo_not_persisted_without_explicit_retention_approval(self):
++        self.store.create_booking(booking_payload())
++        with patch.dict(os.environ, {"STAMFORD_GROUP_VISIT_MODE": "mock"}, clear=True):
++            scan = self.store.create_scan("GR-TEST001", {"eventType": "CheckIn", "imageData": image_data(), "imageWidth": 640, "imageHeight": 480}, mode="mock")
++        self.assertFalse(scan["photoRetained"])
++        self.assertIn("preview-only", scan["photoRetentionStatus"])
++        with self.store._connect() as conn:
++            row = conn.execute("SELECT photo_protected,image_sha256 FROM group_visit_scans WHERE scan_id=?", (scan["scanId"],)).fetchone()
++        self.assertIsNone(row["photo_protected"])
++        self.assertEqual(len(row["image_sha256"]), 64)
++
++    def test_approved_photo_retention_encrypts_bytes_and_applies_expiry(self):
++        self.store.create_booking(booking_payload())
++        with patch.dict(os.environ, {"STAMFORD_GROUP_PHOTO_RETENTION_APPROVED": "1", "STAMFORD_GROUP_PHOTO_RETENTION_DAYS": "21"}, clear=True):
++            scan = self.store.create_scan("GR-TEST001", {"eventType": "CheckIn", "imageData": image_data(b"private-photo"), "imageWidth": 640, "imageHeight": 480}, mode="mock")
++        self.assertTrue(scan["photoRetained"])
++        self.assertEqual(scan["photoRetentionStatus"], "encrypted-retention-enabled")
++        with self.store._connect() as conn:
++            row = conn.execute("SELECT photo_protected,photo_retention_expires_at_utc FROM group_visit_scans WHERE scan_id=?", (scan["scanId"],)).fetchone()
++        self.assertEqual(row["photo_protected"], b"encrypted:private-photo")
++        self.assertIsNotNone(row["photo_retention_expires_at_utc"])
++
++    def test_mock_group_checkin_checkout_is_collective_and_idempotent(self):
++        self.store.create_booking(booking_payload())
++        with patch.dict(os.environ, {"STAMFORD_GROUP_VISIT_MODE": "mock"}, clear=True):
++            checkin_meta = self.store.create_scan("GR-TEST001", {"eventType": "CheckIn", "imageData": image_data(), "imageWidth": 640, "imageHeight": 480}, mode="mock")
++            checkin_match = self.store.mock_match_result("GR-TEST001", checkin_meta, 640, 480)
++            self.store.update_scan_match(checkin_meta["scanId"], checkin_match)
++            selected = checkin_match["candidates"][:2]
++            checkin = self.store.confirm_mock_scan("GR-TEST001", {"scanId": checkin_meta["scanId"], "eventType": "CheckIn", "operator": "Test Operator", "confirmBatch": True, "confirmations": [{"ticketId": x["ticketId"], "memberId": x["memberId"], "confirmMatch": True} for x in selected]})
++            self.assertEqual(checkin["recordedCount"], 2)
++            self.assertTrue(checkin["simulated"])
++            booking = self.store.get_booking("GR-TEST001")
++            self.assertTrue(booking["arrivalAtUtc"])
++            self.assertEqual(sum(1 for x in booking["roster"] if x["attendanceState"] == "CheckedIn"), 2)
++            with self.assertRaises(GroupVisitError) as ctx:
++                self.store.confirm_mock_scan("GR-TEST001", {"scanId": checkin_meta["scanId"], "eventType": "CheckIn", "operator": "Test Operator", "confirmBatch": True, "confirmations": [{"ticketId": selected[0]["ticketId"], "memberId": selected[0]["memberId"], "confirmMatch": True}]})
++            self.assertEqual(ctx.exception.code, "GROUP_SCAN_ALREADY_FINALISED")
++            checkout_meta = self.store.create_scan("GR-TEST001", {"eventType": "CheckOut", "imageData": image_data(), "imageWidth": 640, "imageHeight": 480}, mode="mock")
++            checkout_match = self.store.mock_match_result("GR-TEST001", checkout_meta, 640, 480)
++            self.store.update_scan_match(checkout_meta["scanId"], checkout_match)
++            checkout_members = {x["memberId"]: x for x in checkout_match["candidates"]}
++            # Only people actually checked in are selected for face checkout.
++            checkout = self.store.confirm_mock_scan("GR-TEST001", {"scanId": checkout_meta["scanId"], "eventType": "CheckOut", "operator": "Test Operator", "confirmBatch": True, "confirmations": [{"ticketId": checkout_members[x["memberId"]]["ticketId"], "memberId": x["memberId"], "confirmMatch": True} for x in selected]})
++            self.assertEqual(checkout["recordedCount"], 2)
++            self.assertEqual(self.store.get_booking("GR-TEST001")["status"], "Departed — reconciliation required")
++
++    def test_checkout_cannot_be_captured_before_group_arrival(self):
++        self.store.create_booking(booking_payload())
++        with self.assertRaises(GroupVisitError) as ctx:
++            self.store.create_scan("GR-TEST001", {"eventType": "CheckOut", "imageData": image_data(), "imageWidth": 640, "imageHeight": 480}, mode="mock")
++        self.assertEqual(ctx.exception.code, "GROUP_CHECKIN_REQUIRED")
++
++    def test_roster_locked_after_arrival_and_manual_reconciliation_requires_reason(self):
++        self.store.create_booking(booking_payload())
++        with patch.dict(os.environ, {"STAMFORD_GROUP_VISIT_MODE": "mock"}, clear=True):
++            self.store.create_scan("GR-TEST001", {"eventType": "CheckIn", "imageData": image_data(), "imageWidth": 640, "imageHeight": 480}, mode="mock")
++        with self.assertRaises(GroupVisitError) as ctx:
++            self.store.add_roster("GR-TEST001", {"rosterMembers": [{"personType": "Guardian", "displayName": "Late Guardian"}]})
++        self.assertEqual(ctx.exception.code, "ROSTER_LOCKED")
++        group = self.store.get_booking("GR-TEST001")
++        with self.assertRaises(GroupVisitError) as ctx:
++            self.store.reconcile("GR-TEST001", {"operator": "Test Operator", "reason": "", "decisions": [{"memberId": group["roster"][0]["memberId"], "disposition": "CheckedIn"}]})
++        self.assertEqual(ctx.exception.code, "FIELD_REQUIRED")
++
++
++class GroupVisitApiTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.root = Path(self.temp.name)
++        ui = self.root / "ui"
++        ui.mkdir()
++        (ui / "index.html").write_text("<title>group test</title>", encoding="utf-8")
++        state = StateStore(self.root / "data" / "state.sqlite3")
++        domain = DomainStore(state.db_path)
++        face = FaceAttendanceStore(self.root / "data" / "face-attendance.sqlite3", protector=lambda raw, desc: b"enc:" + raw, unprotector=lambda raw: raw.removeprefix(b"enc:"))
++        groups = GroupVisitStore(face.db_path, protector=lambda raw, desc: b"enc:" + raw, unprotector=lambda raw: raw.removeprefix(b"enc:"))
++        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(ui, state, domain, face, group_store=groups))
++        self.server.daemon_threads = True
++        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
++        self.thread.start()
++        self.base = f"http://127.0.0.1:{self.server.server_port}"
++
++    def tearDown(self):
++        self.server.shutdown()
++        self.server.server_close()
++        self.thread.join(timeout=2)
++        self.temp.cleanup()
++
++    def request(self, method, path, body=None):
++        raw = None if body is None else json.dumps(body).encode()
++        req = Request(self.base + path, data=raw, headers={"Content-Type": "application/json"}, method=method)
++        try:
++            with urlopen(req, timeout=4) as response:
++                return response.status, json.loads(response.read().decode())
++        except HTTPError as exc:
++            return exc.code, json.loads(exc.read().decode())
++
++    def test_group_status_api_defaults_to_safe_mock_and_preview_only(self):
++        with patch.dict(os.environ, {}, clear=True):
++            code, status = self.request("GET", "/api/v1/group-visits/status")
++        self.assertEqual(code, 200)
++        self.assertEqual(status["mode"], "mock")
++        self.assertFalse(status["liveFaceMatchingApprovalFlag"])
++        self.assertFalse(status["groupPhotoUsedForEnrollment"])
++        self.assertEqual(status["photoRetention"]["status"], "preview-only")
++
++    def test_group_booking_scan_and_confirm_routes(self):
++        with patch.dict(os.environ, {"STAMFORD_GROUP_VISIT_MODE": "mock"}, clear=True):
++            code, created = self.request("POST", "/api/v1/group-visits", booking_payload())
++            self.assertEqual(code, 201)
++            group = created["group"]
++            self.assertEqual(group["expectedCount"], 3)
++            code, scan = self.request("POST", "/api/v1/group-visits/GR-TEST001/scan", {"eventType": "CheckIn", "imageData": image_data(), "imageWidth": 640, "imageHeight": 480, "operator": "Test Operator"})
++            self.assertEqual(code, 200)
++            self.assertTrue(scan["simulated"])
++            self.assertFalse(scan["groupImageUsedForEnrollment"])
++            self.assertEqual(len(scan["candidates"]), 3)
++            selected = scan["candidates"][:2]
++            code, confirmed = self.request("POST", "/api/v1/group-visits/GR-TEST001/confirm", {"scanId": scan["scanId"], "eventType": "CheckIn", "operator": "Test Operator", "confirmBatch": True, "confirmations": [{"ticketId": x["ticketId"], "memberId": x["memberId"], "confirmMatch": True} for x in selected]})
++            self.assertEqual(code, 201)
++            self.assertEqual(confirmed["recordedCount"], 2)
++            self.assertFalse(confirmed["writtenToGenetec"])
++            code, loaded = self.request("GET", "/api/v1/group-visits/GR-TEST001")
++            self.assertEqual(code, 200)
++            self.assertEqual(loaded["group"]["checkedInCount"], 2)
++            self.assertIn("arrivalAtUtc", loaded["group"])
++
++    def test_group_qr_api_issues_validates_rotates_and_renders_svg(self):
++        payload = booking_payload("GR-APIQR001")
++        payload["startsAtLocal"] = "2026-10-19T09:30"
++        payload["endsAtLocal"] = "2026-10-19T12:00"
++        code, created = self.request("POST", "/api/v1/group-visits", payload)
++        self.assertEqual(code, 201)
++        token = created["group"]["groupQrToken"]
++        code, validated = self.request("POST", "/api/v1/group-visits/qr/validate", {"groupQrToken": token})
++        self.assertEqual(code, 200)
++        self.assertFalse(validated["groupQrAuthorisesAttendance"])
++        req = Request(self.base + "/api/v1/group-visits/qr/svg", data=json.dumps({"groupQrToken": token}).encode(), headers={"Content-Type": "application/json"}, method="POST")
++        with urlopen(req, timeout=4) as response:
++            self.assertEqual(response.status, 200)
++            self.assertIn("image/svg+xml", response.headers.get("Content-Type", ""))
++            self.assertIn(b"<svg", response.read())
++        code, rotated = self.request("POST", "/api/v1/group-visits/GR-APIQR001/qr/rotate", {})
++        self.assertEqual(code, 200)
++        self.assertNotEqual(token, rotated["groupQrToken"])
++        code, rejected = self.request("POST", "/api/v1/group-visits/qr/validate", {"groupQrToken": token})
++        self.assertEqual(code, 410)
++        self.assertEqual(rejected["error"], "GROUP_QR_REVOKED")
++
++    def test_api_rejects_unknown_group_and_invalid_image_dimensions(self):
++        code, result = self.request("POST", "/api/v1/group-visits/GR-MISSING/scan", {"eventType": "CheckIn", "imageData": image_data(), "imageWidth": 12, "imageHeight": 12})
++        self.assertEqual(code, 404)
++        self.assertEqual(result["error"], "GROUP_NOT_FOUND")
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/tests/test_repository_contracts.py b/tests/test_repository_contracts.py
+index 978db03..11d0f33 100644
+--- a/tests/test_repository_contracts.py
++++ b/tests/test_repository_contracts.py
+@@ -199,20 +199,20 @@ class RepositoryContractTests(unittest.TestCase):
+         self.assertIn("function navigate(v){if(currentView==='kiosk'&&v!=='kiosk'){stopQrCamera(false);stopKioskFaceCamera(false);}", self.ui)
+ 
+     def test_milestone_511_build_marker_and_stale_build_prevention(self):
+-        self.assertIn('<title>Stamford VMS | Visitor Management System · UI 5.2.4</title>', self.ui)
++        self.assertIn('<title>Stamford VMS | Visitor Management System · UI 5.3.0</title>', self.ui)
+         self.assertNotIn('UI 5.2.0', self.ui)
+-        self.assertIn('meta name="vms-build" content="5.2.4"', self.ui)
+-        self.assertIn('UI BUILD 5.2.4', self.ui)
+-        self.assertIn("const VMS_BUILD='5.2.4'", self.ui)
++        self.assertIn('meta name="vms-build" content="5.3.0"', self.ui)
++        self.assertIn('UI BUILD 5.3.0', self.ui)
++        self.assertIn("const VMS_BUILD='5.3.0'", self.ui)
+         self.assertNotIn('Planned visit window', self.ui)
+         self.assertNotIn('A USB QR scanner that types into a field', self.ui)
+         launcher = (ROOT / "Start-Demo.cmd").read_text(encoding="utf-8")
+-        self.assertIn("BUILD 5.2.4", launcher)
++        self.assertIn("BUILD 5.3.0", launcher)
+         self.assertIn("PORT_IN_USE", launcher)
+         self.assertIn("previous VMS instance", launcher)
+         service = (ROOT / "service" / "vms_service.py").read_text(encoding="utf-8")
+-        self.assertIn('"build": "5.2.4"', service)
+-        self.assertIn("StamfordVMSPrototype/5.2.4", service)
++        self.assertIn('"build": "5.3.0"', service)
++        self.assertIn("StamfordVMSPrototype/5.3.0", service)
+         self.assertIn('Cache-Control", "no-store, no-cache, must-revalidate, max-age=0', service)
+ 
+     def test_checkout_recovery_requires_readback_verified_checkin_first(self):
+@@ -229,6 +229,20 @@ class RepositoryContractTests(unittest.TestCase):
+         # not accidentally disable it based on the just-completed check-in record.
+         self.assertNotIn("retry.disabled=!(lastBridgeResponse.connected===true", self.ui)
+ 
++    def test_group_visit_workflow_is_booking_scoped_and_clears_ephemeral_photo_state(self):
++        self.assertIn('id="groupVisitCapturePanel"', self.ui)
++        self.assertIn('Collective check-in', self.ui)
++        self.assertIn('Collective check-out', self.ui)
++        self.assertIn('Capture & match roster', self.ui)
++        self.assertIn('drawGroupVisitAnnotations(groupVisitPhoto,data)', self.ui)
++        self.assertIn('LIVE MODE · GATED', self.ui)
++        self.assertIn('No mock fallback will occur.', self.ui)
++        self.assertIn("/api/v1/group-visits/${encodeURIComponent(groupId)}/scan", self.ui)
++        self.assertIn('function closeGroupVisitCapture()', self.ui)
++        self.assertIn("canvas.getContext('2d').clearRect(0,0,canvas.width,canvas.height)", self.ui)
++        self.assertIn('VMS-GRP-007', (ROOT / "docs" / "REQUIREMENTS-TRACEABILITY.csv").read_text(encoding="utf-8-sig"))
++        self.assertIn('a group photograph is never used to create or update a biometric enrollment/template', (ROOT / "docs" / "GROUP-VISIT-WORKFLOW.md").read_text(encoding="utf-8").lower())
++
+     def test_face_attendance_is_opt_in_and_group_photo_enrollment_is_blocked(self):
+         face = (ROOT / "service" / "face_attendance.py").read_text(encoding="utf-8")
+         self.assertIn('STAMFORD_FACE_ATTENDANCE_ENABLED', face)
+diff --git a/tests/test_vms_service.py b/tests/test_vms_service.py
+index 7eb6a23..654760e 100644
+--- a/tests/test_vms_service.py
++++ b/tests/test_vms_service.py
+@@ -53,7 +53,7 @@ class VmsServiceTests(unittest.TestCase):
+         self.assertTrue(body["boundToLoopback"])
+         self.assertEqual(body["authentication"], "not-configured")
+         self.assertEqual(body["mode"], "prototype-only")
+-        self.assertEqual(body["build"], "5.2.4")
++        self.assertEqual(body["build"], "5.3.0")
+ 
+     def test_face_attendance_feature_is_gated_by_default(self):
+         with patch.dict(os.environ, {}, clear=True):
