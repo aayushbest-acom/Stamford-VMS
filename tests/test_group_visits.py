@@ -208,7 +208,7 @@ class GroupVisitApiTests(unittest.TestCase):
         domain = DomainStore(state.db_path)
         face = FaceAttendanceStore(self.root / "data" / "face-attendance.sqlite3", protector=lambda raw, desc: b"enc:" + raw, unprotector=lambda raw: raw.removeprefix(b"enc:"))
         groups = GroupVisitStore(face.db_path, protector=lambda raw, desc: b"enc:" + raw, unprotector=lambda raw: raw.removeprefix(b"enc:"))
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(ui, state, domain, face, group_store=groups))
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(ui, state, domain, face, group_store=groups, auth_enabled=False))
         self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()

@@ -24,7 +24,7 @@ class IntegrationAdapterTests(unittest.TestCase):
         (self.ui / "index.html").write_text("<!doctype html><title>Test</title>", encoding="utf-8")
         self.db = self.root / "data" / "prototype.sqlite3"
         self.store = StateStore(self.db)
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.ui, self.store))
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.ui, self.store, auth_enabled=False))
         self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()

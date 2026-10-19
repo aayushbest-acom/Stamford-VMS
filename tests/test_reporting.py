@@ -154,7 +154,7 @@ class ReportingApiTests(unittest.TestCase):
         self.face = FaceAttendanceStore(self.face_db)
         self.integration = IntegrationHub(self.main_db)
         self.groups = GroupVisitStore(self.face_db)
-        handler = make_handler(self.ui_dir, self.store, self.domain, self.face, self.integration, self.groups)
+        handler = make_handler(self.ui_dir, self.store, self.domain, self.face, self.integration, self.groups, auth_enabled=False)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)

@@ -170,20 +170,20 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("function navigate(v){if(currentView==='kiosk'&&v!=='kiosk'){stopQrCamera(false);stopKioskFaceCamera(false);}", self.ui)
 
     def test_milestone_511_build_marker_and_stale_build_prevention(self):
-        self.assertIn('<title>Stamford VMS | Visitor Management System · UI 5.4.0</title>', self.ui)
+        self.assertIn('<title>Stamford VMS | Visitor Management System · UI 5.5.0</title>', self.ui)
         self.assertNotIn('UI 5.2.0', self.ui)
-        self.assertIn('meta name="vms-build" content="5.4.0"', self.ui)
-        self.assertIn('UI BUILD 5.4.0', self.ui)
-        self.assertIn("const VMS_BUILD='5.4.0'", self.ui)
+        self.assertIn('meta name="vms-build" content="5.5.0"', self.ui)
+        self.assertIn('UI BUILD 5.5.0', self.ui)
+        self.assertIn("const VMS_BUILD='5.5.0'", self.ui)
         self.assertNotIn('Planned visit window', self.ui)
         self.assertNotIn('A USB QR scanner that types into a field', self.ui)
         launcher = (ROOT / "Start-Demo.cmd").read_text(encoding="utf-8")
-        self.assertIn("BUILD 5.4.0", launcher)
+        self.assertIn("BUILD 5.5.0", launcher)
         self.assertIn("PORT_IN_USE", launcher)
         self.assertIn("previous VMS instance", launcher)
         service = (ROOT / "service" / "vms_service.py").read_text(encoding="utf-8")
-        self.assertIn('"build": "5.4.0"', service)
-        self.assertIn("StamfordVMSPrototype/5.4.0", service)
+        self.assertIn('"build": "5.5.0"', service)
+        self.assertIn("StamfordVMSPrototype/5.5.0", service)
         self.assertIn('Cache-Control", "no-store, no-cache, must-revalidate, max-age=0', service)
 
 
@@ -323,6 +323,16 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn('secrets.token_urlsafe(32)', domain)
         self.assertIn('qr_token_hash TEXT UNIQUE', domain)
         self.assertIn('def token_digest(token: str)', domain)
+
+    def test_access_control_requires_server_auth_and_keeps_authenticated_state_out_of_browser_storage(self):
+        service = (ROOT / "service" / "vms_service.py").read_text(encoding="utf-8")
+        access = (ROOT / "service" / "access_control.py").read_text(encoding="utf-8")
+        auth_ui = (ROOT / "ui" / "access-control.js").read_text(encoding="utf-8")
+        self.assertIn("auth_enabled: bool = True", service)
+        self.assertIn("PERMISSION_MAPPING_REQUIRED", service)
+        self.assertIn("_require_administrator_actor", access)
+        self.assertIn("if(!authenticated){try{localStorage.setItem(DEMO_STORAGE_KEY", self.ui)
+        self.assertIn("window.addEventListener('focus', () => refreshCurrentSession())", auth_ui)
 
 
 if __name__ == "__main__":

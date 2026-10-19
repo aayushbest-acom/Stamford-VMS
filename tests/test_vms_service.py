@@ -20,7 +20,7 @@ class VmsServiceTests(unittest.TestCase):
         self.ui.mkdir()
         (self.ui / "index.html").write_text("<!doctype html><title>Test UI</title>", encoding="utf-8")
         self.store = StateStore(self.root / "data" / "test.sqlite3")
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.ui, self.store))
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.ui, self.store, auth_enabled=False))
         self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -49,9 +49,9 @@ class VmsServiceTests(unittest.TestCase):
         code, body = self.request("GET", "/api/v1/health")
         self.assertEqual(code, 200)
         self.assertTrue(body["boundToLoopback"])
-        self.assertEqual(body["authentication"], "not-configured")
+        self.assertEqual(body["authentication"], "test-bypass")
         self.assertEqual(body["mode"], "prototype-only")
-        self.assertEqual(body["build"], "5.4.0")
+        self.assertEqual(body["build"], "5.5.0")
 
     def test_face_attendance_feature_is_gated_by_default(self):
         with patch.dict(os.environ, {}, clear=True):

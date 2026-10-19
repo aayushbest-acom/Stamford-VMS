@@ -1,13 +1,13 @@
 # Stamford VMS Prototype Repository
 
 **Project:** ACOM × Stamford American International School — Visitor Management System
-**Current milestone:** 5.4.0 — operational report catalogue and multi-format exports, building on Group Visits, visitor types and Stamford branding
+**Current milestone:** 5.5.0 — local accounts, session authentication and server-enforced feature-level permissions, building on reporting, Group Visits, visitor types and Stamford branding
 **Repository status:** Prototype source, synthetic data, and a loopback-only .NET Framework bridge. Not a production release.
 
 ## What is in this repository
 
 - `ui/` — Stamford-branded browser prototype. Visitor, kiosk, group, replacement-card and AI-review workflows remain demonstrative unless explicitly stated otherwise.
-- `service/vms_service.py` — loopback-only HTTP service with SQLite snapshot persistence plus dedicated visitor-domain routes. `service/domain.py` implements transactional visit transitions and secure QR validation; neither service has production authentication/RBAC.
+- `service/vms_service.py` — loopback-only HTTP service with SQLite snapshot persistence plus dedicated visitor-domain routes. `service/domain.py` implements transactional visit transitions and secure QR validation; the service enables local prototype accounts and server-enforced feature permissions, but is not a production identity platform.
 - `tests/` — automated regression tests for snapshot persistence, domain transitions, reporting/export integrity, QR token handling, retry idempotency, and source/credential-store safety contracts.
 - `docs/REQUIREMENTS-TRACEABILITY.csv`, `docs/IMPLEMENTATION-STATUS.md` and `docs/VALIDATION-REPORT.md` — requirement-by-requirement delivery status, validation evidence and remaining acceptance gates. See `docs/GENETEC-LOCAL-CREDENTIAL-SETUP.md` for saving bridge credentials once.
 - `GenetecReadOnlyBridge/` — .NET Framework 4.8 bridge, using the locally installed Genetec Security Center 5.11 SDK. It binds only to `127.0.0.1:5190`.
@@ -97,7 +97,7 @@ The local Python service now includes a separate SQLite-backed domain API for sy
 
 New secure visits created in the UI use the domain API. The browser only keeps the raw pass in memory for QR rendering; it is omitted from localStorage and the whole-snapshot persistence payload. After reload, the UI can issue a replacement pass for an invited booking; rotation revokes the prior pass. Seeded records remain explicitly marked demo simulations.
 
-The UI still has no application authentication or role-based authorization. This API is loopback-only and synthetic-data-only; it is a prototype domain API, not production-approved. Before real identities or public use, add approved authentication/authorization, rate limits, CSRF/threat controls for the final deployment, a transactional production data model, signed-off policies and the remaining acceptance evidence.
+The UI uses local account authentication and server-enforced role/permission checks. This API is still loopback-only and synthetic-data-only; it is a prototype access-control implementation, not production-approved. Before real identities or public use, add approved authentication/authorization, rate limits, CSRF/threat controls for the final deployment, a transactional production data model, signed-off policies and the remaining acceptance evidence.
 
 ## Day 3: saved Genetec connection profile
 
@@ -143,7 +143,7 @@ See `docs/GENETEC-CARDHOLDER-FACE-SYNC.md`. This remains a gated prototype, not 
 
 This incremental build adds an approval-gated, read-only bulk import of Genetec Cardholder metadata scoped by an explicit Student External ID prefix. The local roster stores Cardholder GUIDs, identifiers, names, portrait availability and masked credential references; it does not bulk-store portraits or raw credential values. A portrait is fetched in memory on demand for staff visual review. Attendance is recorded in the local VMS ledger only after staff confirm the selected record and person, and checkout requires a prior check-in in the same session.
 
-The feature does not identify a person from an arbitrary image or write attendance to Genetec. Use an External ID prefix reserved for the approved student population; unfiltered exports are blocked. Because application authentication/RBAC is not yet implemented, use synthetic data only. See `docs/GENETEC-STUDENT-ROSTER-AND-ATTENDANCE.md`.
+The feature does not identify a person from an arbitrary image or write attendance to Genetec. Use an External ID prefix reserved for the approved student population; unfiltered exports are blocked. Because this remains prototype authentication/RBAC, use synthetic data only. See `docs/GENETEC-STUDENT-ROSTER-AND-ATTENDANCE.md`.
 
 
 ## Build 5.2.3 — dual-mode prototype integrations
@@ -166,7 +166,7 @@ The self-service kiosk now offers Student, Staff and Contractor attendance choic
 
 The Group Visits view adds persistent group bookings with mixed Student/Guardian/Staff/Contractor/Other roster members, booking-scoped opaque QR passes, separate arrival/departure webcam capture metadata, annotated candidate preview, individually confirmed batch attendance and complete roster reconciliation. Mock mode uses clearly labelled scripted candidates; it does not analyse images. Live candidate matching is disabled by default and is scoped to approved individual profiles explicitly linked to the selected booking. Group photos are never enrolled as biometric templates and are not retained by default; optional retention requires explicit approval, expiry and Windows DPAPI protection.
 
-This remains a local prototype without enterprise authentication/RBAC. Use synthetic data only, keep the service loopback-only, and do not enable live biometric matching or photo retention until Stamford signs off the expanded purpose, notices/consent, eligible populations, retention and access policy. The group flow does not implement automatic expected-vs-observed headcount comparison or validated large-group subgroup handling. See [`docs/GROUP-VISIT-WORKFLOW.md`](docs/GROUP-VISIT-WORKFLOW.md), [`docs/CHANGE-REQUEST-GROUP-VISIT.md`](docs/CHANGE-REQUEST-GROUP-VISIT.md), and [`docs/VALIDATION-REPORT-MILESTONE5.3.0-GROUP-VISIT.md`](docs/VALIDATION-REPORT-MILESTONE5.3.0-GROUP-VISIT.md).
+This remains a local prototype without enterprise identity/SSO or production authorization hardening. Use synthetic data only, keep the service loopback-only, and do not enable live biometric matching or photo retention until Stamford signs off the expanded purpose, notices/consent, eligible populations, retention and access policy. The group flow does not implement automatic expected-vs-observed headcount comparison or validated large-group subgroup handling. See [`docs/GROUP-VISIT-WORKFLOW.md`](docs/GROUP-VISIT-WORKFLOW.md), [`docs/CHANGE-REQUEST-GROUP-VISIT.md`](docs/CHANGE-REQUEST-GROUP-VISIT.md), and [`docs/VALIDATION-REPORT-MILESTONE5.3.0-GROUP-VISIT.md`](docs/VALIDATION-REPORT-MILESTONE5.3.0-GROUP-VISIT.md).
 
 
 ## Build 5.3.2 — Stamford frontend branding
@@ -179,3 +179,12 @@ The provided Stamford American International School logo is now used in the pers
 The Reports & exports workspace runs 17 report types from local data stores: visitor register, inside register, overdue/unresolved visits, daily/visitor-type/host summaries, visitor event log, visitor-type catalogue, group register, group-roster attendance, individual attendance, Genetec sync status, imported Genetec Cardholder roster, SMS delivery log, transactional audit log, and replacement-card and AI-event demo snapshots. Reports can be previewed and exported as CSV, Excel XLSX, JSON, PDF or standalone HTML. Shared filters are available, with date filtering disabled for demo snapshots that do not have reliable dates. Visitor email is excluded by default and can be added only for the Visitor Register.
 
 Exports are server-generated from transactional source records where available, include source limitations, and omit QR tokens, raw credentials, portraits, face samples and group-photo bytes. CSV formula injection is mitigated and XLSX data uses string cells. Preview is capped at 200 rows and exports at 25,000 rows. The reports are operational prototype output, not a tamper-resistant enterprise audit log. See [`docs/REPORTING-EXPORTS.md`](docs/REPORTING-EXPORTS.md).
+
+
+## Build 5.5.0 — Local accounts and feature permissions
+
+- First launch requires one-time creation of the initial Administrator account; subsequent launches require username/password sign-in. Passwords are stored as PBKDF2-HMAC-SHA256 hashes with random salts, sessions expire after eight hours, login attempts are rate-limited, and authenticated writes require CSRF tokens.
+- Built-in groups: Administrator, Security Operator, Receptionist, Host, Card Counter Operator, Group Organiser, Auditor and Read-only. Administrators can create accounts and custom permission groups, assign group membership, reset passwords, disable accounts, and allow/deny individual features for an account.
+- Feature permissions are enforced by the local API (unknown API routes deny by default). Security-control-plane mutations are restricted to members of the built-in Administrator group; a last-administrator guard prevents accidental lockout.
+- The initial Administrator account can be bootstrapped only while the account database is empty. Keep the service bound to loopback. This remains a prototype—not SSO/MFA, enterprise audit storage, or a production identity system. Use synthetic data only until security review and production IAM are approved.
+- Authenticated dashboard snapshots are not written to browser local storage. Transactional APIs remain the authoritative source for visits, attendance and other records.

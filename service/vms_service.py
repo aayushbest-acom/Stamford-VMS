@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Loopback-only local persistence/static service for the Stamford VMS prototype.
 
-This service is deliberately a prototype persistence layer, not a production API:
-there is no enterprise authentication/authorization and browser snapshots remain
-client-authored. It binds only to loopback and uses optimistic revision checks to
-prevent silent last-write-wins overwrites between browser sessions.
+This service is a loopback-only prototype API. Local account authentication and
+server-enforced feature permissions are enabled by default. Browser snapshots remain
+client-authored demo state, while transactional endpoints have explicit permission gates.
 """
 from __future__ import annotations
 
@@ -50,6 +49,11 @@ try:
     from .reporting import ReportingError, ReportService
 except ImportError:  # direct script execution
     from reporting import ReportingError, ReportService
+
+try:
+    from .access_control import AccessControlError, AccessControlStore, PERMISSIONS
+except ImportError:  # direct script execution
+    from access_control import AccessControlError, AccessControlStore, PERMISSIONS
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
 SCHEMA_VERSION = 1
@@ -160,16 +164,67 @@ def validate_snapshot(payload: object) -> tuple[int, dict]:
     return revision, normalized
 
 
-def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | None = None, face_store: FaceAttendanceStore | None = None, integration_hub: IntegrationHub | None = None, group_store: GroupVisitStore | None = None):
+def required_permissions(method: str, path: str, query: str = "") -> list[str] | None:
+    """Closed-by-default server-side route to feature-permission mapping."""
+    method = method.upper()
+    if path == "/api/v1/health": return []
+    if method == "GET":
+        if path == "/api/v1/state": return ["snapshot.view"]
+        if path in {"/api/v1/access/accounts"}: return ["accounts.manage"]
+        if path in {"/api/v1/access/groups"}: return ["permissions.manage"]
+        if path == "/api/v1/access/permission-catalog": return ["permissions.manage"]
+        if path == "/api/v1/access/audit": return ["permissions.manage"]
+        if path == "/api/v1/integrations/status": return ["integrations.view"]
+        if path == "/api/v1/integrations/sms/outbox": return ["integrations.view"]
+        if path == "/api/v1/reports/catalog": return ["reports.view"]
+        if path == "/api/v1/visitor-types": return ["visitor_types.view"]
+        if path == "/api/v1/visits" or re.fullmatch(r"/api/v1/visits/[^/]+", path): return ["visits.view"]
+        if path in {"/api/v1/group-visits", "/api/v1/group-visits/status"} or re.fullmatch(r"/api/v1/group-visits/[^/]+", path): return ["groups.view"]
+        if path in {"/api/v1/face-attendance/status", "/api/v1/face-attendance/students", "/api/v1/face-attendance/genetec-cardholders", "/api/v1/face-attendance/events", "/api/v1/kiosk-face/status", "/api/v1/kiosk-face/events", "/api/v1/genetec/student-roster", "/api/v1/genetec/student-roster/groups", "/api/v1/genetec/student-roster/attendance"}: return ["attendance.view"] if "genetec/student-roster" not in path else ["genetec.view"]
+        if re.fullmatch(r"/api/v1/genetec/student-roster/[0-9a-fA-F-]{36}/portrait", path): return ["genetec.view"]
+        if path.startswith("/api/v1/"): return None
+        return None
+    if method == "PUT":
+        if path == "/api/v1/state": return ["snapshot.manage"]
+        return None
+    if method == "POST":
+        if path == "/api/v1/state": return ["snapshot.manage"]
+        if path in {"/api/v1/reports/preview"}: return ["reports.view"]
+        if path == "/api/v1/reports/export": return ["reports.export"]
+        if path == "/api/v1/integrations/sms/send": return ["integrations.manage"]
+        if path == "/api/v1/visitor-types": return ["visitor_types.manage"]
+        if re.fullmatch(r"/api/v1/visitor-types/[a-z0-9-]+/update", path, re.I): return ["visitor_types.manage"]
+        if path in {"/api/v1/visits"}: return ["visits.create"]
+        if re.fullmatch(r"/api/v1/visits/[^/]+/(amend|cancel|qr/rotate)", path): return ["visits.manage"]
+        if path in {"/api/v1/qr/decode-frame", "/api/v1/qr/validate", "/api/v1/qr/svg", "/api/v1/qr/check-in", "/api/v1/qr/check-out"}: return ["visits.kiosk"]
+        if path in {"/api/v1/group-visits", "/api/v1/group-visits/qr/validate", "/api/v1/group-visits/qr/svg"}: return ["groups.manage"] if path == "/api/v1/group-visits" else ["groups.view"]
+        if re.fullmatch(r"/api/v1/group-visits/[^/]+/(qr/rotate|roster|scan|confirm|reconcile)", path): return ["groups.manage"]
+        if path == "/api/v1/genetec/student-roster/import": return ["genetec.manage"]
+        if re.fullmatch(r"/api/v1/genetec/student-roster/[0-9a-fA-F-]{36}/attendance", path): return ["attendance.manage"]
+        if path == "/api/v1/face-attendance/enroll-from-genetec": return ["attendance.manage", "genetec.manage"]
+        if path in {"/api/v1/face-attendance/enroll", "/api/v1/face-attendance/confirm", "/api/v1/face-attendance/group-confirm-batch", "/api/v1/kiosk-face/confirm"} or re.fullmatch(r"/api/v1/face-attendance/students/[^/]+/revoke", path): return ["attendance.manage"]
+        if path == "/api/v1/face-attendance/genetec-sync/retry": return ["genetec.manage"]
+        if path in {"/api/v1/face-attendance/match", "/api/v1/face-attendance/group-match", "/api/v1/kiosk-face/match"}: return ["attendance.view"]
+        if path == "/api/v1/access/accounts": return ["accounts.manage", "permissions.manage"]
+        if re.fullmatch(r"/api/v1/access/accounts/[0-9]+/(update|reset-password)", path): return ["accounts.manage"]
+        if re.fullmatch(r"/api/v1/access/accounts/[0-9]+/(groups|overrides)", path): return ["permissions.manage"]
+        if path == "/api/v1/access/groups" or re.fullmatch(r"/api/v1/access/groups/[^/]+/(permissions|update)", path): return ["permissions.manage"]
+        if path.startswith("/api/v1/"): return None
+        return None
+    return None
+
+
+def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | None = None, face_store: FaceAttendanceStore | None = None, integration_hub: IntegrationHub | None = None, group_store: GroupVisitStore | None = None, access_store: AccessControlStore | None = None, auth_enabled: bool = True):
     ui_dir = ui_dir.resolve()
     domain_store = domain_store or DomainStore(store.db_path)
     face_store = face_store or FaceAttendanceStore(store.db_path.with_name("face-attendance.sqlite3"))
     group_store = group_store or GroupVisitStore(face_store.db_path)
     integration_hub = integration_hub or IntegrationHub(store.db_path)
+    access_store = access_store or AccessControlStore(store.db_path.with_name("access-control.sqlite3"))
     report_service = ReportService(store.db_path, face_store.db_path)
 
     class Handler(SimpleHTTPRequestHandler):
-        server_version = "StamfordVMSPrototype/5.4.0"
+        server_version = "StamfordVMSPrototype/5.5.0"
         sys_version = ""
 
         def __init__(self, *args, **kwargs):
@@ -179,12 +234,14 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
             # Log method/path only. Never log query strings, request bodies, visitor fields, or tokens.
             logging.info("%s %s %s", self.client_address[0], self.command, urlsplit(self.path).path[:120])
 
-        def _send_json(self, code: int, payload: dict):
+        def _send_json(self, code: int, payload: dict, headers: dict | None = None):
             raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
             self.send_header("Cache-Control", "no-store")
+            for header_name, header_value in (headers or {}).items():
+                self.send_header(header_name, header_value)
             self.end_headers()
             self.wfile.write(raw)
 
@@ -208,6 +265,127 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
             self.send_header("Content-Disposition", "inline; filename=visitor-pass.svg")
             self.end_headers()
             self.wfile.write(payload)
+
+        def _session_token(self) -> str | None:
+            from http.cookies import SimpleCookie
+            cookie = SimpleCookie()
+            try:
+                cookie.load(self.headers.get("Cookie", ""))
+                return cookie["stamford_vms_session"].value if "stamford_vms_session" in cookie else None
+            except Exception:
+                return None
+
+        def _auth_context(self):
+            if not auth_enabled:
+                return {"user": {"accountId": 0, "username": "test-bypass", "displayName": "Test bypass", "isActive": True}, "groups": [], "permissions": sorted(PERMISSIONS and {p["key"] for p in PERMISSIONS}), "csrfToken": "test-csrf", "sessionHash": "test"}
+            if not hasattr(self, "_resolved_auth_context"):
+                self._resolved_auth_context = access_store.resolve_session(self._session_token())
+            return self._resolved_auth_context
+
+        def _clear_session_cookie(self):
+            return "stamford_vms_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict"
+
+        def _session_cookie(self, token: str):
+            return f"stamford_vms_session={token}; Max-Age={8 * 60 * 60}; Path=/; HttpOnly; SameSite=Strict"
+
+        def _handle_auth_status(self):
+            context = self._auth_context()
+            self._send_json(200, {"ok": True, "setupRequired": access_store.account_count() == 0, "authenticated": bool(context),
+                                  "user": context.get("user") if context else None,
+                                  "groups": context.get("groups", []) if context else [],
+                                  "permissions": context.get("permissions", []) if context else [],
+                                  "csrfToken": context.get("csrfToken") if context else None,
+                                  "sessionExpiresInHours": 8 if context else None})
+
+        def _require_permission(self, method: str, path: str) -> bool:
+            if not auth_enabled or path == "/api/v1/health":
+                return True
+            if path.startswith("/api/v1/auth/"):
+                return True
+            context = self._auth_context()
+            if not context:
+                self._send_json(401, {"ok": False, "error": "AUTHENTICATION_REQUIRED", "message": "Sign in to Stamford VMS to continue."})
+                return False
+            if path.startswith("/api/v1/access/") and not any(group.get("groupId") == "administrator" for group in context.get("groups", [])):
+                self._send_json(403, {"ok": False, "error": "ADMINISTRATOR_ROLE_REQUIRED", "message": "Only the built-in Administrator role can view or change account and permission administration data."})
+                return False
+            required = required_permissions(method, path, urlsplit(self.path).query)
+            # Group scan routes may run the live face matcher. Mock capture does not need biometric permission.
+            if method == "POST" and re.fullmatch(r"/api/v1/group-visits/[^/]+/scan", path) and group_store.status().get("mode") == "live":
+                required = (required or []) + ["attendance.view"]
+            # Portraits contain biometric imagery; reading the general Genetec roster is not enough.
+            if method == "GET" and re.fullmatch(r"/api/v1/genetec/student-roster/[0-9a-fA-F-]{36}/portrait", path):
+                required = ["genetec.manage"]
+            if required is None:
+                self._send_json(403, {"ok": False, "error": "PERMISSION_MAPPING_REQUIRED", "message": "This API operation has no permission mapping and is denied by default."})
+                return False
+            missing = [permission for permission in required if permission not in context["permissions"]]
+            if missing:
+                self._send_json(403, {"ok": False, "error": "PERMISSION_DENIED", "message": "Your account is not permitted to perform this operation.", "requiredPermissions": required})
+                return False
+            if method in {"POST", "PUT", "PATCH", "DELETE"} and path not in {"/api/v1/auth/login", "/api/v1/auth/bootstrap"}:
+                if not access_store.validate_csrf(context, self.headers.get("X-Stamford-CSRF")):
+                    self._send_json(403, {"ok": False, "error": "CSRF_VALIDATION_FAILED", "message": "Refresh your authenticated session before performing this action."})
+                    return False
+            self._resolved_auth_context = context
+            return True
+
+        def _handle_auth_post(self, path: str, payload: dict) -> bool:
+            if path == "/api/v1/auth/bootstrap":
+                try:
+                    context, token, csrf = access_store.create_bootstrap_admin(payload.get("username"), payload.get("displayName"), payload.get("password"))
+                    self._resolved_auth_context = context
+                    self._send_json(201, {"ok": True, "user": context["user"], "groups": context["groups"], "permissions": context["permissions"], "csrfToken": csrf}, {"Set-Cookie": self._session_cookie(token)})
+                except AccessControlError as exc:
+                    self._send_json(exc.status, {"ok": False, "error": exc.code, "message": exc.message})
+                except ValueError as exc:
+                    self._send_json(400, {"ok": False, "error": "INVALID_BOOTSTRAP", "message": str(exc)})
+                return True
+            if path == "/api/v1/auth/login":
+                try:
+                    context, token, csrf = access_store.login(payload.get("username", ""), payload.get("password", ""))
+                    self._resolved_auth_context = context
+                    self._send_json(200, {"ok": True, "user": context["user"], "groups": context["groups"], "permissions": context["permissions"], "csrfToken": csrf}, {"Set-Cookie": self._session_cookie(token)})
+                except AccessControlError as exc:
+                    self._send_json(exc.status, {"ok": False, "error": exc.code, "message": exc.message})
+                return True
+            if path == "/api/v1/auth/logout":
+                context = self._auth_context()
+                if context and auth_enabled:
+                    if not access_store.validate_csrf(context, self.headers.get("X-Stamford-CSRF")):
+                        self._send_json(403, {"ok": False, "error": "CSRF_VALIDATION_FAILED", "message": "Refresh your authenticated session before logging out."})
+                        return True
+                    access_store.logout(context)
+                self._resolved_auth_context = None
+                self._send_json(200, {"ok": True}, {"Set-Cookie": self._clear_session_cookie()})
+                return True
+            return False
+
+        def _handle_access_control_post(self, path: str, payload: dict) -> bool:
+            context = self._auth_context()
+            if path == "/api/v1/access/accounts":
+                result = access_store.create_account(payload, context); self._send_json(201, result); return True
+            m = re.fullmatch(r"/api/v1/access/accounts/(\d+)/update", path)
+            if m:
+                self._send_json(200, access_store.update_account(int(m.group(1)), payload, context)); return True
+            m = re.fullmatch(r"/api/v1/access/accounts/(\d+)/reset-password", path)
+            if m:
+                self._send_json(200, access_store.reset_password(int(m.group(1)), payload.get("password"), context)); return True
+            m = re.fullmatch(r"/api/v1/access/accounts/(\d+)/groups", path)
+            if m:
+                self._send_json(200, access_store.assign_groups(int(m.group(1)), payload.get("groupIds"), context)); return True
+            m = re.fullmatch(r"/api/v1/access/accounts/(\d+)/overrides", path)
+            if m:
+                self._send_json(200, access_store.set_overrides(int(m.group(1)), payload.get("overrides"), context)); return True
+            if path == "/api/v1/access/groups":
+                self._send_json(201, access_store.create_group(payload, context)); return True
+            m = re.fullmatch(r"/api/v1/access/groups/([^/]+)/permissions", path)
+            if m:
+                self._send_json(200, access_store.update_group_permissions(unquote(m.group(1)), payload.get("permissionKeys"), context)); return True
+            m = re.fullmatch(r"/api/v1/access/groups/([^/]+)/update", path)
+            if m:
+                self._send_json(200, access_store.update_group(unquote(m.group(1)), payload, context)); return True
+            return False
 
         def _read_json_body(self):
             raw_len = self.headers.get("Content-Length", "0")
@@ -270,8 +448,25 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
             if not self._request_allowed():
                 return
             path = urlsplit(self.path).path
+            if path == "/api/v1/auth/status":
+                self._handle_auth_status()
+                return
             if path == "/api/v1/health":
-                self._send_json(200, {"ok": True, "service": "Stamford VMS local prototype service", "build": "5.4.0", "schoolTimeZone": "Asia/Singapore", "mode": "prototype-only", "persistence": "sqlite-local", "authentication": "not-configured", "boundToLoopback": True})
+                self._send_json(200, {"ok": True, "service": "Stamford VMS local prototype service", "build": "5.5.0", "schoolTimeZone": "Asia/Singapore", "mode": "prototype-only", "persistence": "sqlite-local", "authentication": "enabled" if auth_enabled else "test-bypass", "boundToLoopback": True})
+                return
+            if path.startswith("/api/v1/") and not self._require_permission("GET", path):
+                return
+            if path == "/api/v1/access/permission-catalog":
+                self._send_json(200, {"ok": True, "permissions": PERMISSIONS})
+                return
+            if path == "/api/v1/access/accounts":
+                self._send_json(200, access_store.list_accounts())
+                return
+            if path == "/api/v1/access/groups":
+                self._send_json(200, access_store.list_groups())
+                return
+            if path == "/api/v1/access/audit":
+                self._send_json(200, access_store.list_audit())
                 return
             if path == "/api/v1/integrations/status":
                 try:
@@ -292,7 +487,18 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
                 return
             if path == "/api/v1/state":
                 try:
-                    self._send_json(200, store.load())
+                    loaded = store.load()
+                    context = self._auth_context()
+                    if auth_enabled and loaded.get("state") and context:
+                        permitted_arrays = {"visits": "visits.view", "cards": "cards.view", "groups": "groups.view", "events": "events.view", "audit": "audit.view"}
+                        snapshot = loaded["state"]
+                        for key, permission in permitted_arrays.items():
+                            if permission not in context["permissions"]:
+                                snapshot[key] = []
+                        if "dashboard.view" not in context["permissions"]:
+                            snapshot["activity"] = []
+                        loaded["state"] = snapshot
+                    self._send_json(200, loaded)
                 except Exception:
                     logging.exception("Unable to load prototype state")
                     self._send_json(500, {"ok": False, "error": "STATE_LOAD_FAILED", "message": "Saved state could not be loaded. Stop and preserve the local database for investigation."})
@@ -455,7 +661,10 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
         def do_PUT(self):
             if not self._request_allowed():
                 return
-            if urlsplit(self.path).path != "/api/v1/state":
+            path = urlsplit(self.path).path
+            if not self._require_permission("PUT", path):
+                return
+            if path != "/api/v1/state":
                 self._send_json(404, {"ok": False, "error": "NOT_FOUND"})
                 return
             raw_len = self.headers.get("Content-Length", "0")
@@ -497,7 +706,28 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
                 self._send_json(400, {"ok": False, "error": code, "message": "Request body must be valid UTF-8 JSON and within the configured size limit."})
                 return
 
+            if path in {"/api/v1/auth/login", "/api/v1/auth/bootstrap", "/api/v1/auth/logout"}:
+                if not isinstance(payload, dict):
+                    self._send_json(400, {"ok": False, "error": "INVALID_JSON_OBJECT", "message": "Request body must be a JSON object."})
+                    return
+                if self._handle_auth_post(path, payload):
+                    return
+            if path.startswith("/api/v1/") and not self._require_permission("POST", path):
+                return
+            if auth_enabled and isinstance(payload, dict):
+                live_confirm = re.fullmatch(r"/api/v1/group-visits/([^/]+)/confirm", path)
+                if live_confirm:
+                    try:
+                        pending_scan = group_store.get_scan(unquote(live_confirm.group(1)).upper(), str(payload.get("scanId", "")))
+                    except Exception:
+                        pending_scan = None  # Let the normal domain handler return the specific invalid/expired scan error.
+                    context = self._auth_context()
+                    if pending_scan and pending_scan.get("mode") == "live" and (not context or "attendance.manage" not in context.get("permissions", [])):
+                        self._send_json(403, {"ok": False, "error": "PERMISSION_DENIED", "message": "Live group attendance confirmation requires attendance-management permission.", "requiredPermissions": ["attendance.manage", "groups.manage"]})
+                        return
             try:
+                if path.startswith("/api/v1/access/") and self._handle_access_control_post(path, payload):
+                    return
                 if path == "/api/v1/reports/preview":
                     self._send_json(200, report_service.preview(payload))
                     return
@@ -677,6 +907,10 @@ def make_handler(ui_dir: Path, store: StateStore, domain_store: DomainStore | No
                 self._send_json(404, {"ok": False, "error": "NOT_FOUND", "message": "No API route matches this request."})
             except ReportingError as exc:
                 self._send_json(exc.status, {"ok": False, "error": exc.code, "message": exc.message})
+            except AccessControlError as exc:
+                self._send_json(exc.status, {"ok": False, "error": exc.code, "message": exc.message})
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": "INVALID_ACCESS_CONTROL_INPUT", "message": str(exc)[:240]})
             except DomainError as exc:
                 self._send_domain_error(exc)
             except FaceAttendanceError as exc:
@@ -730,7 +964,7 @@ def main(argv=None) -> int:
         logging.info("Group visit API: GET /api/v1/group-visits/status|/api/v1/group-visits; POST /api/v1/group-visits, /qr/validate|svg, /{groupId}/qr/rotate|roster|scan|confirm|reconcile")
         logging.info("Optional gated face attendance API: GET /api/v1/face-attendance/status; POST /api/v1/face-attendance/enroll|match|confirm|group-match|group-confirm-batch")
         logging.info("Approved local Genetec student roster API: GET /api/v1/genetec/student-roster/groups; POST /api/v1/genetec/student-roster/import; GET /api/v1/genetec/student-roster; GET /api/v1/genetec/student-roster/{guid}/portrait; POST /api/v1/genetec/student-roster/{guid}/attendance")
-        logging.warning("PROTOTYPE ONLY: no enterprise authentication/authorization; use synthetic data only; do not expose beyond loopback")
+        logging.warning("PROTOTYPE ONLY: local account authentication and feature permissions are enabled; this is not an enterprise identity provider; use synthetic data only and do not expose beyond loopback")
         logging.info("Press Ctrl+C to stop")
         try:
             server.serve_forever(poll_interval=0.25)

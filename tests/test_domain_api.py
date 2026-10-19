@@ -29,7 +29,7 @@ class DomainApiTests(unittest.TestCase):
         db = self.root / "data" / "test.sqlite3"
         self.state_store = StateStore(db)
         self.domain = DomainStore(db)
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.ui, self.state_store, self.domain))
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.ui, self.state_store, self.domain, auth_enabled=False))
         self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
