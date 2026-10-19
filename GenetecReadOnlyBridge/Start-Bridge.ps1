@@ -1,7 +1,10 @@
 param(
     [switch]$EnableTestCardholderWrites,
     [switch]$EnableVisitorSync,
-    [switch]$EnableVisitorLifecycleSync
+    [switch]$EnableVisitorLifecycleSync,
+    [switch]$EnableCardholderFaceSync,
+    [switch]$ConfirmBiometricPolicyApproved,
+    [switch]$ConfirmGenetecCardholderFaceSyncApproval
 )
 
 $ErrorActionPreference = 'Stop'
@@ -38,6 +41,12 @@ if (-not (Test-Path $exe)) {
     throw "Bridge executable not found at '$exe'. Build GenetecReadOnlyBridge.csproj on this Windows host with the compatible Genetec SDK installed, then start the bridge again."
 }
 
+$anyFaceOption = $EnableCardholderFaceSync -or $ConfirmBiometricPolicyApproved -or $ConfirmGenetecCardholderFaceSyncApproval
+$allFaceOptions = $EnableCardholderFaceSync -and $ConfirmBiometricPolicyApproved -and $ConfirmGenetecCardholderFaceSyncApproval
+if ($anyFaceOption -and -not $allFaceOptions) {
+    throw 'Cardholder photo/credential-reference lookup requires -EnableCardholderFaceSync, -ConfirmBiometricPolicyApproved and -ConfirmGenetecCardholderFaceSyncApproval together, and only after written school approval and person-specific consent.'
+}
+
 # Supply the saved connection fields only to this child bridge process. Do not
 # write secrets to source, command-line arguments, logs or repository settings.
 $env:GENETEC_SERVER = [string]$genetecProfile.server
@@ -45,20 +54,27 @@ $env:GENETEC_USERNAME = [string]$genetecProfile.username
 $env:GENETEC_CERT = [string]$genetecProfile.certificate
 $env:GENETEC_PASSWORD = [string]$genetecProfile.password
 $env:GENETEC_PORT = [string]$(if ($genetecProfile.port) { $genetecProfile.port } else { 5500 })
-$env:GENETEC_ENABLE_TEST_WRITES = if ($EnableTestCardholderWrites) { '1' } else { '0' }
-$env:GENETEC_ENABLE_VISITOR_SYNC = if ($EnableVisitorSync) { '1' } else { '0' }
-$env:GENETEC_ENABLE_VISITOR_LIFECYCLE_SYNC = if ($EnableVisitorLifecycleSync) { '1' } else { '0' }
 $genetecProfile = $null
 
+$bridgeArgs = @()
+if ($EnableTestCardholderWrites) { $bridgeArgs += '--enable-test-cardholder-writes' }
+if ($EnableVisitorSync) { $bridgeArgs += '--enable-visitor-sync' }
+if ($EnableVisitorLifecycleSync) { $bridgeArgs += '--enable-visitor-lifecycle-sync' }
+if ($EnableCardholderFaceSync) { $bridgeArgs += '--enable-cardholder-face-sync' }
+if ($ConfirmBiometricPolicyApproved) { $bridgeArgs += '--confirm-biometric-policy-approved' }
+if ($ConfirmGenetecCardholderFaceSyncApproval) { $bridgeArgs += '--confirm-genetec-cardholder-face-sync-approved' }
+
 try {
-    $writeMode = if ($EnableTestCardholderWrites -or $EnableVisitorSync -or $EnableVisitorLifecycleSync) { 'one or more explicitly requested, guarded test write scopes' } else { 'read-only (default)' }
+    $writeMode = if ($EnableTestCardholderWrites -or $EnableVisitorSync -or $EnableVisitorLifecycleSync) { 'guarded developer write scopes (synthetic visitor IDs; no credentials/access rights)' } else { 'read-only (default)' }
     Write-Host "SDK: $sdk" -ForegroundColor Gray
     Write-Host "Write mode: $writeMode" -ForegroundColor $(if ($writeMode -eq 'read-only (default)') { 'Green' } else { 'Yellow' })
+    if ($allFaceOptions) { Write-Warning 'Cardholder photo/credential-reference reads are enabled by explicit policy acknowledgement. Verify written approval, consent and scope before using this live Directory.' }
+    Write-Host 'Feature scope selection: direct command-line switches (not environment-variable flags).' -ForegroundColor Gray
     Write-Host 'Listener: 127.0.0.1:5190' -ForegroundColor Green
-    & $exe
+    & $exe @bridgeArgs
     if ($LASTEXITCODE -ne 0) { throw "Genetec bridge exited with code $LASTEXITCODE." }
 } finally {
-    foreach ($name in @('GENETEC_PASSWORD','GENETEC_SERVER','GENETEC_USERNAME','GENETEC_CERT','GENETEC_PORT','GENETEC_ENABLE_TEST_WRITES','GENETEC_ENABLE_VISITOR_SYNC','GENETEC_ENABLE_VISITOR_LIFECYCLE_SYNC','GSC_SDK')) {
+    foreach ($name in @('GENETEC_PASSWORD','GENETEC_SERVER','GENETEC_USERNAME','GENETEC_CERT','GENETEC_PORT','GSC_SDK')) {
         Remove-Item "Env:$name" -ErrorAction SilentlyContinue
     }
     $genetecProfile = $null

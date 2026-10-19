@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Data;
+using System.Diagnostics;
 using System.IO;
 using System.Globalization;
 using System.Drawing;
@@ -23,7 +24,7 @@ namespace StamfordVms.GenetecReadOnlyBridge
     internal static class Program
     {
         private const string Prefix = "http://127.0.0.1:5190/";
-        private const string BridgeBuild = "5.2.4";
+        private const string BridgeBuild = "5.2.8";
         private const string TestWriteConfirmation = "CREATE_ONLY_STAMFORD_VMS_TEST_CARDHOLDER";
         private const string VisitorSyncConfirmation = "SYNC_SYNTHETIC_STAMFORD_VMS_VISITOR";
         private const string VisitorLifecycleConfirmation = "SYNC SYNTHETIC STAMFORD VMS VISITOR LIFECYCLE";
@@ -34,9 +35,44 @@ namespace StamfordVms.GenetecReadOnlyBridge
         private const string TestLastName = "Test Cardholder";
         private static readonly JavaScriptSerializer Serializer = new JavaScriptSerializer();
         private static string _sdkDirectory;
+        private static bool _enableTestCardholderWrites;
+        private static bool _enableVisitorSync;
+        private static bool _enableVisitorLifecycleSync;
+        private static bool _enableCardholderFaceSync;
+        private static bool _confirmBiometricPolicyApproved;
+        private static bool _confirmGenetecCardholderFaceSyncApproved;
 
         private static int Main(string[] args)
         {
+            if (args != null && args.Length > 0 &&
+                String.Equals(args[0], "--visitor-booking-worker", StringComparison.OrdinalIgnoreCase))
+            {
+                return RunVisitorBookingWorker(args.Skip(1).ToArray());
+            }
+
+            // A CLR exception outside the request loop must leave a useful local trace. This does
+            // not intercept native fail-fast/AccessViolation crashes, but it avoids losing managed
+            // exception details when an SDK callback escapes its expected handler.
+            AppDomain.CurrentDomain.UnhandledException += (sender, eventArgs) =>
+            {
+                try
+                {
+                    Console.Error.WriteLine("FATAL unhandled CLR exception; terminating=" + eventArgs.IsTerminating + ": " + eventArgs.ExceptionObject);
+                    Console.Error.Flush();
+                }
+                catch { /* Never throw from the process-level diagnostic hook. */ }
+            };
+
+            try
+            {
+                ConfigureStartupScopes(args);
+            }
+            catch (ArgumentException ex)
+            {
+                Console.Error.WriteLine("Invalid Genetec bridge startup scopes: " + ex.Message);
+                return 64;
+            }
+
             _sdkDirectory = Environment.GetEnvironmentVariable("GSC_SDK");
             if (String.IsNullOrWhiteSpace(_sdkDirectory))
             {
@@ -72,6 +108,10 @@ namespace StamfordVms.GenetecReadOnlyBridge
                     Console.WriteLine(IsVisitorLifecycleSyncEnabled()
                         ? "GUARDED VISITOR LIFECYCLE ENABLED: native check-in/check-out candidate path for synthetic bookings only."
                         : "Visitor lifecycle sync remains disabled.");
+                    Console.WriteLine(IsCardholderFaceSyncApproved()
+                        ? "GUARDED CARDHOLDER PHOTO LOOKUP ENABLED by explicit command-line policy acknowledgements; read-only and bounded."
+                        : "Cardholder photo/credential-reference lookup remains disabled until the explicit school policy acknowledgement switches are supplied.");
+                    Console.WriteLine("Feature scopes are passed as command-line switches; no GENETEC_ENABLE_* environment variables are used.");
                     Console.WriteLine("Press Ctrl+C to stop.");
 
                     while (listener.IsListening)
@@ -80,7 +120,10 @@ namespace StamfordVms.GenetecReadOnlyBridge
                         try { context = listener.GetContext(); }
                         catch (HttpListenerException) { break; }
                         catch (ObjectDisposedException) { break; }
-                        Handle(context);
+                        // Isolate every HTTP request. A managed exception in a response serializer,
+                        // an SDK wrapper, or a malformed request must not unwind the listener loop and
+                        // take the bridge offline after a Visitor write has already committed.
+                        HandleSafely(context);
                     }
                 }
                 return 0;
@@ -96,6 +139,62 @@ namespace StamfordVms.GenetecReadOnlyBridge
             {
                 Console.Error.WriteLine("Bridge startup failed: " + ex.GetType().Name + " — " + ex.Message);
                 return 1;
+            }
+        }
+
+        private static void HandleSafely(HttpListenerContext context)
+        {
+            string requestId = Guid.NewGuid().ToString("N");
+            string method = "unknown";
+            string path = "/";
+            try
+            {
+                if (context != null && context.Request != null)
+                {
+                    method = context.Request.HttpMethod ?? "unknown";
+                    path = context.Request.Url == null ? "/" : context.Request.Url.AbsolutePath;
+                }
+            }
+            catch { /* Request metadata is diagnostic only. */ }
+
+            Console.WriteLine("HTTP request start: requestId=" + requestId + " method=" + method + " path=" + path);
+            Console.Out.Flush();
+            try
+            {
+                Handle(context);
+            }
+            catch (Exception ex)
+            {
+                // Log stack and inner-exception details locally; never include request body,
+                // visitor names, credentials, or photo bytes in these diagnostics.
+                Console.Error.WriteLine("Unhandled HTTP request exception: requestId=" + requestId +
+                    " method=" + method + " path=" + path + " exception=" + ex);
+                Console.Error.Flush();
+                try
+                {
+                    WriteJson(context.Response, 500, new
+                    {
+                        success = false,
+                        errorCode = "BRIDGE_REQUEST_HANDLER_FAILED",
+                        requestId = requestId,
+                        error = "The bridge could not finish this request. Check the local bridge log and verify Genetec before retrying."
+                    });
+                }
+                catch (Exception responseException)
+                {
+                    Console.Error.WriteLine("Could not send request failure response: requestId=" + requestId + " exception=" + responseException);
+                    try { context.Response.Abort(); } catch { }
+                }
+            }
+            finally
+            {
+                try
+                {
+                    Console.WriteLine("HTTP request complete: requestId=" + requestId + " method=" + method +
+                        " path=" + path + " status=" + context.Response.StatusCode.ToString(CultureInfo.InvariantCulture));
+                    Console.Out.Flush();
+                }
+                catch { /* Response status may be inaccessible after a client disconnect. */ }
             }
         }
 
@@ -116,7 +215,7 @@ namespace StamfordVms.GenetecReadOnlyBridge
             if (!String.IsNullOrEmpty(origin)) response.Headers["Access-Control-Allow-Origin"] = origin;
             response.Headers["Vary"] = "Origin";
             response.Headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS";
-            response.Headers["Access-Control-Allow-Headers"] = "Content-Type";
+            response.Headers["Access-Control-Allow-Headers"] = "Content-Type, X-Stamford-CSRF";
             response.Headers["Cache-Control"] = "no-store";
 
             if (String.Equals(request.HttpMethod, "OPTIONS", StringComparison.OrdinalIgnoreCase))
@@ -136,22 +235,22 @@ namespace StamfordVms.GenetecReadOnlyBridge
                 statusCode = 200;
                 bool testCardholderWriteEnabled = IsTestWriteEnabled();
                 bool visitorSyncEnabled = IsVisitorSyncEnabled();
+                bool visitorLifecycleSyncEnabled = IsVisitorLifecycleSyncEnabled();
                 payload = new
                 {
                     service = "Stamford VMS Genetec Bridge",
                     bridge = "online",
                     bridgeBuild = BridgeBuild,
                     bridgeExecutablePath = Assembly.GetExecutingAssembly().Location,
-                    mode = testCardholderWriteEnabled || visitorSyncEnabled ? "read-only-with-separately-guarded-write-scopes" : "read-only",
+                    mode = IsAnyWriteScopeEnabled() ? "read-only-with-separately-guarded-write-scopes" : "read-only",
                     sdkDirectoryConfigured = !String.IsNullOrWhiteSpace(_sdkDirectory) && System.IO.Directory.Exists(_sdkDirectory),
-                    writeOperationsEnabled = testCardholderWriteEnabled || visitorSyncEnabled,
+                    writeOperationsEnabled = IsAnyWriteScopeEnabled(),
                     testCardholderWriteEnabled = testCardholderWriteEnabled,
                     visitorSyncEnabled = visitorSyncEnabled,
-                    visitorLifecycleSyncEnabled = IsVisitorLifecycleSyncEnabled(),
-                    writeScope = testCardholderWriteEnabled && visitorSyncEnabled
-                        ? "fixed-test-cardholder-and-invited-synthetic-native-visitor-only"
-                        : (testCardholderWriteEnabled ? "one-fixed-test-cardholder-create-only" : (visitorSyncEnabled ? "invited-synthetic-native-visitor-create-update-only" : "disabled")),
-                    lifecycleScope = IsVisitorLifecycleSyncEnabled() ? "synthetic-native-visitor-checkin-checkout-only" : "disabled"
+                    visitorLifecycleSyncEnabled = visitorLifecycleSyncEnabled,
+                    cardholderFaceSyncEnabled = IsCardholderFaceSyncApproved(),
+                    writeScope = BuildEnabledWriteScopeDescription(),
+                    lifecycleScope = visitorLifecycleSyncEnabled ? "synthetic-native-visitor-checkin-checkout-only" : "disabled"
                 };
             }
             else if (String.Equals(request.HttpMethod, "GET", StringComparison.OrdinalIgnoreCase) &&
@@ -173,11 +272,13 @@ namespace StamfordVms.GenetecReadOnlyBridge
                         errorCode = ex.Code,
                         error = ex.Message,
                         checkedAtUtc = DateTime.UtcNow.ToString("o"),
-                        writeOperationsEnabled = IsTestWriteEnabled(),
-                        writeScope = IsTestWriteEnabled() ? "one-fixed-test-cardholder-create-only" : "disabled",
+                        writeOperationsEnabled = IsAnyWriteScopeEnabled(),
+                        writeScope = BuildEnabledWriteScopeDescription(),
                         visitorManagementLicensed = false,
-                        visitorSyncEnabled = false,
-                        visitorSyncScope = "disabled"
+                        visitorSyncEnabled = IsVisitorSyncEnabled(),
+                        visitorSyncScope = IsVisitorSyncEnabled() ? "enabled-but-licence-or-session-not-verified" : "disabled",
+                        visitorLifecycleSyncEnabled = IsVisitorLifecycleSyncEnabled(),
+                        cardholderFaceSyncEnabled = IsCardholderFaceSyncApproved()
                     };
                 }
                 catch (Exception ex)
@@ -192,11 +293,13 @@ namespace StamfordVms.GenetecReadOnlyBridge
                         errorCode = "GENETEC_STATUS_FAILED",
                         error = "The bridge could not complete the read-only Genetec status check. Review local bridge logs.",
                         checkedAtUtc = DateTime.UtcNow.ToString("o"),
-                        writeOperationsEnabled = IsTestWriteEnabled(),
-                        writeScope = IsTestWriteEnabled() ? "one-fixed-test-cardholder-create-only" : "disabled",
+                        writeOperationsEnabled = IsAnyWriteScopeEnabled(),
+                        writeScope = BuildEnabledWriteScopeDescription(),
                         visitorManagementLicensed = false,
-                        visitorSyncEnabled = false,
-                        visitorSyncScope = "disabled"
+                        visitorSyncEnabled = IsVisitorSyncEnabled(),
+                        visitorSyncScope = IsVisitorSyncEnabled() ? "enabled-but-licence-or-session-not-verified" : "disabled",
+                        visitorLifecycleSyncEnabled = IsVisitorLifecycleSyncEnabled(),
+                        cardholderFaceSyncEnabled = IsCardholderFaceSyncApproved()
                     };
                 }
             }
@@ -430,8 +533,12 @@ namespace StamfordVms.GenetecReadOnlyBridge
                             "The request must explicitly confirm synchronising one synthetic VMS appointment to Genetec.");
                     }
 
-                    payload = CreateOrUpdateVmsVisitor(body);
-                    statusCode = 200;
+                    // Genetec's SDK contains native components. Isolate the native Visitor write in a
+                    // short-lived worker so an SDK process crash cannot take down this HTTP bridge.
+                    // The worker repeats the request gate, and the parent reports its real result.
+                    VisitorWorkerResult workerResult = ExecuteVisitorBookingInWorker(body);
+                    payload = workerResult.Payload;
+                    statusCode = workerResult.StatusCode;
                 }
                 catch (BridgeException ex)
                 {
@@ -448,7 +555,8 @@ namespace StamfordVms.GenetecReadOnlyBridge
                 }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine("Visitor booking sync failed: " + ex.GetType().Name + " — " + ex.Message);
+                    Console.Error.WriteLine("Visitor booking sync handler failed: " + ex);
+                    Console.Error.Flush();
                     statusCode = 503;
                     payload = new
                     {
@@ -550,12 +658,12 @@ namespace StamfordVms.GenetecReadOnlyBridge
                      !String.Equals(request.HttpMethod, "POST", StringComparison.OrdinalIgnoreCase))
             {
                 statusCode = 405;
-                payload = new { error = "method_not_allowed", writeOperationsEnabled = IsTestWriteEnabled() };
+                payload = new { error = "method_not_allowed", writeOperationsEnabled = IsAnyWriteScopeEnabled() };
             }
             else
             {
                 statusCode = 404;
-                payload = new { error = "not_found", writeOperationsEnabled = IsTestWriteEnabled() };
+                payload = new { error = "not_found", writeOperationsEnabled = IsAnyWriteScopeEnabled() };
             }
 
             WriteJson(response, statusCode, payload);
@@ -563,17 +671,43 @@ namespace StamfordVms.GenetecReadOnlyBridge
 
         private static bool IsCardholderFaceSyncApproved()
         {
-            return IsEnvEnabled("STAMFORD_FACE_ATTENDANCE_ENABLED") &&
-                IsEnvEnabled("STAMFORD_BIOMETRIC_POLICY_APPROVED") &&
-                IsEnvEnabled("STAMFORD_GENETEC_CARDHOLDER_FACE_SYNC_APPROVED");
+            // This scope only exposes read-only Cardholder photo/credential-reference APIs.
+            // The three explicit command-line acknowledgements replace environment-variable toggles.
+            // They are not a substitute for actual written school approval and person-specific consent.
+            return _enableCardholderFaceSync && _confirmBiometricPolicyApproved &&
+                _confirmGenetecCardholderFaceSyncApproved;
         }
 
-        private static bool IsEnvEnabled(string name)
+        private static void ConfigureStartupScopes(string[] args)
         {
-            string value = Environment.GetEnvironmentVariable(name);
-            return String.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
-                String.Equals(value, "true", StringComparison.OrdinalIgnoreCase) ||
-                String.Equals(value, "yes", StringComparison.OrdinalIgnoreCase);
+            var allowed = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "--enable-test-cardholder-writes",
+                "--enable-visitor-sync",
+                "--enable-visitor-lifecycle-sync",
+                "--enable-cardholder-face-sync",
+                "--confirm-biometric-policy-approved",
+                "--confirm-genetec-cardholder-face-sync-approved"
+            };
+            var supplied = new HashSet<string>(args ?? new string[0], StringComparer.OrdinalIgnoreCase);
+            foreach (string arg in supplied)
+            {
+                if (!allowed.Contains(arg)) throw new ArgumentException("Unsupported argument '" + arg + "'.");
+            }
+
+            _enableTestCardholderWrites = supplied.Contains("--enable-test-cardholder-writes");
+            _enableVisitorSync = supplied.Contains("--enable-visitor-sync");
+            _enableVisitorLifecycleSync = supplied.Contains("--enable-visitor-lifecycle-sync");
+            _enableCardholderFaceSync = supplied.Contains("--enable-cardholder-face-sync");
+            _confirmBiometricPolicyApproved = supplied.Contains("--confirm-biometric-policy-approved");
+            _confirmGenetecCardholderFaceSyncApproved = supplied.Contains("--confirm-genetec-cardholder-face-sync-approved");
+
+            bool anyFaceOption = _enableCardholderFaceSync || _confirmBiometricPolicyApproved || _confirmGenetecCardholderFaceSyncApproved;
+            bool allFaceOptions = _enableCardholderFaceSync && _confirmBiometricPolicyApproved && _confirmGenetecCardholderFaceSyncApproved;
+            if (anyFaceOption && !allFaceOptions)
+            {
+                throw new ArgumentException("Cardholder photo lookup requires all three switches: --enable-cardholder-face-sync, --confirm-biometric-policy-approved, and --confirm-genetec-cardholder-face-sync-approved. Only use these after the required written school approval and person-specific consent are in place.");
+            }
         }
 
         private static void RequireCardholderFaceSyncApproval()
@@ -581,7 +715,7 @@ namespace StamfordVms.GenetecReadOnlyBridge
             if (!IsCardholderFaceSyncApproved())
             {
                 throw new BridgeException(403, "GENETEC_CARDHOLDER_FACE_SYNC_DISABLED",
-                    "Cardholder image/credential-reference sync is disabled. It requires STAMFORD_FACE_ATTENDANCE_ENABLED=1, STAMFORD_BIOMETRIC_POLICY_APPROVED=1, and STAMFORD_GENETEC_CARDHOLDER_FACE_SYNC_APPROVED=1 after written school approval.");
+                    "Cardholder image/credential-reference sync is disabled. Use the three explicit command-line acknowledgement switches only after written school approval and person-specific consent: --enable-cardholder-face-sync, --confirm-biometric-policy-approved, and --confirm-genetec-cardholder-face-sync-approved.");
             }
         }
 
@@ -1286,8 +1420,8 @@ namespace StamfordVms.GenetecReadOnlyBridge
                         cardholderGroupsCount = queryResult.Data.Rows.Count,
                         queryStatus = "success",
                         checkedAtUtc = DateTime.UtcNow.ToString("o"),
-                        writeOperationsEnabled = IsTestWriteEnabled(),
-                        writeScope = IsTestWriteEnabled() ? "one-fixed-test-cardholder-create-only" : "disabled",
+                        writeOperationsEnabled = IsAnyWriteScopeEnabled(),
+                        writeScope = BuildEnabledWriteScopeDescription(),
                         visitorManagementLicensed = visitorManagementLicensed,
                         visitorSyncEnabled = IsVisitorSyncEnabled() && visitorManagementLicensed,
                         visitorSyncScope = IsVisitorSyncEnabled() && visitorManagementLicensed
@@ -1314,6 +1448,199 @@ namespace StamfordVms.GenetecReadOnlyBridge
             }
         }
 
+        private static VisitorWorkerResult ExecuteVisitorBookingInWorker(VisitorSyncRequest request)
+        {
+            string executablePath = Assembly.GetExecutingAssembly().Location;
+            if (String.IsNullOrWhiteSpace(executablePath) || !System.IO.File.Exists(executablePath))
+                throw new BridgeException(503, "VISITOR_SYNC_WORKER_UNAVAILABLE", "The bridge executable path could not be resolved for the isolated Visitor sync worker.");
+
+            var arguments = new List<string> { "--visitor-booking-worker" };
+            if (IsTestWriteEnabled()) arguments.Add("--enable-test-cardholder-writes");
+            if (IsVisitorSyncEnabled()) arguments.Add("--enable-visitor-sync");
+            if (IsVisitorLifecycleSyncEnabled()) arguments.Add("--enable-visitor-lifecycle-sync");
+            if (_enableCardholderFaceSync) arguments.Add("--enable-cardholder-face-sync");
+            if (_confirmBiometricPolicyApproved) arguments.Add("--confirm-biometric-policy-approved");
+            if (_confirmGenetecCardholderFaceSyncApproved) arguments.Add("--confirm-genetec-cardholder-face-sync-approved");
+
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = executablePath,
+                Arguments = String.Join(" ", arguments),
+                WorkingDirectory = AppDomain.CurrentDomain.BaseDirectory,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            string requestJson = Serializer.Serialize(request);
+            using (var process = Process.Start(startInfo))
+            {
+                if (process == null)
+                    throw new BridgeException(503, "VISITOR_SYNC_WORKER_START_FAILED", "The isolated Genetec Visitor sync worker could not be started.");
+
+                Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync();
+                Task<string> stderrTask = process.StandardError.ReadToEndAsync();
+                process.StandardInput.Write(requestJson);
+                process.StandardInput.Close();
+
+                if (!process.WaitForExit(120000))
+                {
+                    try { process.Kill(); } catch { }
+                    try { process.WaitForExit(5000); } catch { }
+                    Console.Error.WriteLine("Visitor sync worker timed out after 120 seconds. booking=" + request.BookingId + "; outcome is unknown; perform read-only lookup before retrying.");
+                    Console.Error.Flush();
+                    throw new BridgeException(504, "VISITOR_SYNC_WORKER_TIMEOUT", "The isolated Genetec Visitor sync did not finish within 120 seconds. Its outcome may be unknown; perform a read-only Visitor lookup before retrying.");
+                }
+
+                Task.WaitAll(stdoutTask, stderrTask);
+                string stdout = (stdoutTask.Result ?? String.Empty).Trim();
+                string stderr = stderrTask.Result ?? String.Empty;
+                if (!String.IsNullOrWhiteSpace(stderr))
+                {
+                    // The worker's stderr contains SDK stage diagnostics/stack details, but not visitor
+                    // names, credentials, image bytes, or request bodies.
+                    Console.Error.WriteLine("Visitor sync worker diagnostics (booking=" + request.BookingId + "): " +
+                        (stderr.Length > 16000 ? stderr.Substring(stderr.Length - 16000) : stderr));
+                    Console.Error.Flush();
+                }
+
+                if (stdout.Length == 0 || stdout.Length > 1024 * 1024)
+                {
+                    Console.Error.WriteLine("Visitor sync worker exited with code " + process.ExitCode +
+                        " and no valid result envelope; booking=" + request.BookingId + ". Inspect Genetec before retrying.");
+                    Console.Error.Flush();
+                    throw new BridgeException(503, "VISITOR_SYNC_WORKER_CRASHED", "The native Genetec Visitor sync worker exited without returning a result. The operation may have committed; perform a read-only Visitor lookup before retrying.");
+                }
+
+                Dictionary<string, object> envelope;
+                try { envelope = Serializer.DeserializeObject(stdout) as Dictionary<string, object>; }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("Visitor sync worker returned invalid JSON: " + ex);
+                    throw new BridgeException(503, "VISITOR_SYNC_WORKER_INVALID_RESULT", "The isolated Genetec Visitor sync worker returned an unreadable result. Perform a read-only Visitor lookup before retrying.");
+                }
+
+                object rawStatus;
+                object rawPayload;
+                int statusCode;
+                if (envelope == null || !envelope.TryGetValue("statusCode", out rawStatus) ||
+                    !Int32.TryParse(Convert.ToString(rawStatus, CultureInfo.InvariantCulture), out statusCode) ||
+                    !envelope.TryGetValue("payload", out rawPayload) || rawPayload == null)
+                {
+                    throw new BridgeException(503, "VISITOR_SYNC_WORKER_INVALID_RESULT", "The isolated Genetec Visitor sync worker did not return a recognised result. Perform a read-only Visitor lookup before retrying.");
+                }
+
+                return new VisitorWorkerResult { StatusCode = statusCode, Payload = rawPayload };
+            }
+        }
+
+        private static int RunVisitorBookingWorker(string[] args)
+        {
+            TextWriter stdout = Console.Out;
+            try
+            {
+                ConfigureStartupScopes(args);
+                if (!IsVisitorSyncEnabled())
+                    throw new BridgeException(403, "VISITOR_SYNC_DISABLED", "The isolated worker did not receive the explicit visitor-sync scope.");
+
+                _sdkDirectory = Environment.GetEnvironmentVariable("GSC_SDK");
+                if (String.IsNullOrWhiteSpace(_sdkDirectory))
+                    _sdkDirectory = @"C:\Program Files (x86)\Genetec Security Center 5.11 SDK";
+                AppDomain.CurrentDomain.AssemblyResolve += ResolveSdkAssembly;
+
+                string body;
+                using (var reader = new StreamReader(Console.OpenStandardInput(), Encoding.UTF8))
+                    body = reader.ReadToEnd();
+                if (String.IsNullOrWhiteSpace(body) || body.Length > 8192)
+                    throw new BridgeException(400, "INVALID_WORKER_REQUEST", "The isolated Visitor worker request is empty or too large.");
+
+                VisitorSyncRequest request;
+                try { request = Serializer.Deserialize<VisitorSyncRequest>(body); }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("Visitor worker JSON parse failed: " + ex);
+                    throw new BridgeException(400, "INVALID_JSON", "The isolated Visitor worker request was not valid JSON.");
+                }
+                if (request == null || !String.Equals(request.Confirmation, VisitorSyncConfirmation, StringComparison.Ordinal))
+                    throw new BridgeException(400, "VISITOR_SYNC_CONFIRMATION_REQUIRED", "The isolated worker requires the explicit visitor-sync confirmation.");
+
+                // Reserve stdout exclusively for one machine-readable result envelope. SDK and stage
+                // diagnostics go to stderr so they cannot corrupt the parent/worker protocol.
+                Console.SetOut(Console.Error);
+                int statusCode = 200;
+                object payload;
+                try
+                {
+                    payload = CreateOrUpdateVmsVisitor(request);
+                }
+                catch (BridgeException ex)
+                {
+                    statusCode = ex.HttpStatusCode;
+                    payload = new
+                    {
+                        success = false,
+                        mode = "guarded-visitor-sync",
+                        errorCode = ex.Code,
+                        error = ex.Message,
+                        checkedAtUtc = DateTime.UtcNow.ToString("o"),
+                        visitorSyncEnabled = IsVisitorSyncEnabled()
+                    };
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("Unhandled Visitor worker exception: " + ex);
+                    statusCode = 503;
+                    payload = new
+                    {
+                        success = false,
+                        mode = "guarded-visitor-sync",
+                        errorCode = "VISITOR_SYNC_WORKER_UNHANDLED_FAILURE",
+                        error = "The isolated Visitor sync worker failed unexpectedly. Check its diagnostics and perform a read-only Visitor lookup before retrying.",
+                        checkedAtUtc = DateTime.UtcNow.ToString("o"),
+                        visitorSyncEnabled = IsVisitorSyncEnabled()
+                    };
+                }
+
+                Console.SetOut(stdout);
+                Console.WriteLine(Serializer.Serialize(new { statusCode = statusCode, payload = payload }));
+                Console.Out.Flush();
+                return 0;
+            }
+            catch (BridgeException ex)
+            {
+                try { Console.SetOut(stdout); } catch { }
+                Console.WriteLine(Serializer.Serialize(new
+                {
+                    statusCode = ex.HttpStatusCode,
+                    payload = new { success = false, mode = "guarded-visitor-sync-worker", errorCode = ex.Code, error = ex.Message }
+                }));
+                Console.Out.Flush();
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                try { Console.SetOut(Console.Error); } catch { }
+                Console.Error.WriteLine("Visitor worker bootstrap failed: " + ex);
+                Console.Error.Flush();
+                try { Console.SetOut(stdout); } catch { }
+                Console.WriteLine(Serializer.Serialize(new
+                {
+                    statusCode = 503,
+                    payload = new { success = false, mode = "guarded-visitor-sync-worker", errorCode = "VISITOR_SYNC_WORKER_BOOTSTRAP_FAILED", error = "The isolated Visitor sync worker could not initialise. Check the local bridge log." }
+                }));
+                Console.Out.Flush();
+                return 0;
+            }
+        }
+
+        private sealed class VisitorWorkerResult
+        {
+            public int StatusCode { get; set; }
+            public object Payload { get; set; }
+        }
+
         private static object CreateOrUpdateVmsVisitor(VisitorSyncRequest request)
         {
             if (!IsVisitorSyncEnabled())
@@ -1338,6 +1665,7 @@ namespace StamfordVms.GenetecReadOnlyBridge
             DateTime departureLocal;
             ParseVisitWindow(request.VisitDate, request.VisitWindow, out arrivalLocal, out departureLocal);
             string operationId = Guid.NewGuid().ToString("D");
+            LogVisitorSyncStage(operationId, bookingId, "validation-complete;connect-start");
 
             // Stable key makes retries idempotent and does not depend on mutable visitor name or schedule.
             // This is a prototype-owned name namespace, not a replacement for the final approved data-ownership design.
@@ -1346,6 +1674,7 @@ namespace StamfordVms.GenetecReadOnlyBridge
             {
                 try
                 {
+                    LogVisitorSyncStage(operationId, bookingId, "connected;directory-server-check-start");
                     var mainServer = engine.GetEntities(EntityType.Server)
                         .OfType<Server>()
                         .FirstOrDefault(server => server.IsMainServer);
@@ -1373,7 +1702,9 @@ namespace StamfordVms.GenetecReadOnlyBridge
                     // SDK cache. It does not discover server-side Visitors, so using it here caused
                     // each HTTP retry (new Engine instance) to create another Visitor. Always run a
                     // Directory-backed exact-name query before deciding to create.
+                    LogVisitorSyncStage(operationId, bookingId, "directory-visitor-lookup-start");
                     var matches = FindVmsVisitorsByKey(engine, entityKey);
+                    LogVisitorSyncStage(operationId, bookingId, "directory-visitor-lookup-complete;matchCount=" + matches.Count.ToString(CultureInfo.InvariantCulture));
                     if (matches.Count > 1)
                     {
                         throw new BridgeException(409, "DUPLICATE_VMS_VISITOR_ENTITIES",
@@ -1431,6 +1762,7 @@ namespace StamfordVms.GenetecReadOnlyBridge
                     // single SDK transaction so the Directory never observes an intermediate default
                     // check-in. The same transaction also keeps updates to an existing invited Visitor
                     // consistent. Synchronous report queries happen only after this transaction commits.
+                    LogVisitorSyncStage(operationId, bookingId, "sdk-transaction-start;operation=" + (created ? "create" : "update"));
                     engine.TransactionManager.ExecuteTransaction(() =>
                     {
                         visitor = created
@@ -1459,15 +1791,19 @@ namespace StamfordVms.GenetecReadOnlyBridge
                         visitor.Status.Activate(DateTime.MinValue, departureLocal);
                         visitor.Departure = departureLocal;
                     });
+                    LogVisitorSyncStage(operationId, bookingId, "sdk-transaction-complete;visitorGuid=" +
+                        (visitor == null ? "unavailable" : visitor.Guid.ToString("D")));
 
                     // Force a server-side Visitor report query for this GUID before reading entity fields back.
                     // This distinguishes a successful Directory query from merely trusting the local UI state/cache.
+                    LogVisitorSyncStage(operationId, bookingId, "server-report-readback-start;visitorGuid=" + visitor.Guid.ToString("D"));
                     if (!VisitorGuidExistsInServerQuery(engine, visitor.Guid))
                     {
                         throw new BridgeException(503, "VISITOR_REPORT_READBACK_FAILED",
                             "The native Visitor write was attempted, but a follow-up Visitor report did not return its GUID. Verify Genetec before retrying.");
                     }
 
+                    LogVisitorSyncStage(operationId, bookingId, "server-report-readback-complete;entity-readback-start");
                     Visitor verified = engine.GetEntity(visitor.Guid) as Visitor;
                     if (verified == null || !String.Equals(verified.Name, entityKey, StringComparison.OrdinalIgnoreCase))
                     {
@@ -1501,7 +1837,9 @@ namespace StamfordVms.GenetecReadOnlyBridge
                             "The native Visitor was not verified as pre-registered. Expected arrival/departure must match and Status must indicate ActivationType=Never with no activation date. The raw active Visitor.CheckinDate property is retained for diagnostics but is not used alone as proof of check-in on this Directory. Inspect Security Desk before retrying.");
                     }
 
+                    LogVisitorSyncStage(operationId, bookingId, "field-and-lifecycle-readback-verified;ledger-persist-start");
                     PersistBookingVisitorGuid(bookingId, verified.Guid);
+                    LogVisitorSyncStage(operationId, bookingId, "complete;visitorGuid=" + verified.Guid.ToString("D"));
                     Console.WriteLine("GUARDED VISITOR SYNC: operation=" + operationId + " " + (created ? "created " : "updated ") + bookingId + " as Genetec Visitor " + verified.Guid.ToString("D") + "; schedule read-back verified and lifecycle mapping stored.");
                     return new
                     {
@@ -1556,7 +1894,8 @@ namespace StamfordVms.GenetecReadOnlyBridge
                 }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine("Native visitor sync failed: operation=" + operationId + " booking=" + bookingId + " " + ex.GetType().Name + " — " + ex.Message);
+                    Console.Error.WriteLine("Native visitor sync failed: operation=" + operationId + " booking=" + bookingId + " exception=" + ex);
+                    Console.Error.Flush();
                     throw new BridgeException(503, "NATIVE_VISITOR_SYNC_FAILED",
                         "Genetec rejected or could not complete this native Visitor operation. Review local bridge logs and confirm the 5.11 SDK, Visitor Management licence and account privileges before retrying.");
                 }
@@ -2464,7 +2803,21 @@ namespace StamfordVms.GenetecReadOnlyBridge
 
         private static bool IsVisitorLifecycleSyncEnabled()
         {
-            return String.Equals(Environment.GetEnvironmentVariable("GENETEC_ENABLE_VISITOR_LIFECYCLE_SYNC"), "1", StringComparison.Ordinal);
+            return _enableVisitorLifecycleSync;
+        }
+
+        private static bool IsAnyWriteScopeEnabled()
+        {
+            return IsTestWriteEnabled() || IsVisitorSyncEnabled() || IsVisitorLifecycleSyncEnabled();
+        }
+
+        private static string BuildEnabledWriteScopeDescription()
+        {
+            var scopes = new List<string>();
+            if (IsTestWriteEnabled()) scopes.Add("fixed-test-cardholder-create-only");
+            if (IsVisitorSyncEnabled()) scopes.Add("invited-vms-visitor-create-update-only");
+            if (IsVisitorLifecycleSyncEnabled()) scopes.Add("synthetic-visitor-checkin-checkout-only");
+            return scopes.Count == 0 ? "disabled" : String.Join(";", scopes);
         }
 
         private static object LookupVmsVisitorByBookingId(string rawBookingId)
@@ -2626,6 +2979,15 @@ namespace StamfordVms.GenetecReadOnlyBridge
                 throw new BridgeException(400, "INVALID_VISITOR_FIELD", "The visitor " + label + " is missing, too long or contains unsupported control characters.");
             }
             return clean;
+        }
+
+        private static void LogVisitorSyncStage(string operationId, string bookingId, string stage)
+        {
+            // The booking ID is a prototype-generated synthetic key; never log guest name, credentials,
+            // request body, image bytes, or the saved Genetec password.
+            Console.WriteLine("NATIVE VISITOR SYNC STAGE: operation=" + operationId + " booking=" + bookingId +
+                " stage=" + stage + " atUtc=" + DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture));
+            Console.Out.Flush();
         }
 
         private static void ParseVisitWindow(string visitDate, string window, out DateTime arrivalLocal, out DateTime departureLocal)
@@ -2947,12 +3309,12 @@ namespace StamfordVms.GenetecReadOnlyBridge
 
         private static bool IsTestWriteEnabled()
         {
-            return String.Equals(Environment.GetEnvironmentVariable("GENETEC_ENABLE_TEST_WRITES"), "1", StringComparison.Ordinal);
+            return _enableTestCardholderWrites;
         }
 
         private static bool IsVisitorSyncEnabled()
         {
-            return String.Equals(Environment.GetEnvironmentVariable("GENETEC_ENABLE_VISITOR_SYNC"), "1", StringComparison.Ordinal);
+            return _enableVisitorSync;
         }
 
         private static WriteRequest ReadWriteRequest(HttpListenerRequest request)
@@ -3051,19 +3413,38 @@ namespace StamfordVms.GenetecReadOnlyBridge
 
         private static void WriteJson(HttpListenerResponse response, int statusCode, object payload)
         {
-            byte[] buffer = Encoding.UTF8.GetBytes(Serializer.Serialize(payload));
-            response.StatusCode = statusCode;
-            response.ContentType = "application/json; charset=utf-8";
-            response.ContentEncoding = Encoding.UTF8;
-            response.ContentLength64 = buffer.Length;
+            byte[] buffer;
             try
             {
+                buffer = Encoding.UTF8.GetBytes(Serializer.Serialize(payload));
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("HTTP JSON serialization failed: " + ex);
+                Console.Error.Flush();
+                statusCode = 500;
+                buffer = Encoding.UTF8.GetBytes("{\"success\":false,\"errorCode\":\"BRIDGE_RESPONSE_SERIALIZATION_FAILED\",\"error\":\"The bridge could not serialize the response. Check the local bridge log before retrying.\"}");
+            }
+
+            try
+            {
+                response.StatusCode = statusCode;
+                response.ContentType = "application/json; charset=utf-8";
+                response.ContentEncoding = Encoding.UTF8;
+                response.ContentLength64 = buffer.Length;
                 using (var output = response.OutputStream)
                 {
                     output.Write(buffer, 0, buffer.Length);
                 }
             }
-            catch (HttpListenerException) { }
+            catch (Exception ex)
+            {
+                // Client disconnects/connection resets are a normal possibility after a long SDK
+                // operation. They must not unwind the HttpListener loop or kill the bridge process.
+                Console.Error.WriteLine("HTTP response delivery failed: " + ex.GetType().Name + " — " + ex.Message);
+                Console.Error.Flush();
+                try { response.Abort(); } catch { }
+            }
         }
 
         private static Assembly ResolveSdkAssembly(object sender, ResolveEventArgs args)

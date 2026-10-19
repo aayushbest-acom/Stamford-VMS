@@ -6,6 +6,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -22,7 +23,16 @@ def image_data(raw=b"synthetic-demo-image"):
     return "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii")
 
 
+def future_visit_window():
+    # QR token tests must not become time-dependent after a hard-coded demo date passes.
+    school_tz = timezone(timedelta(hours=8))
+    starts = (datetime.now(school_tz) + timedelta(hours=2)).replace(second=0, microsecond=0)
+    ends = starts + timedelta(hours=2)
+    return starts.strftime("%Y-%m-%dT%H:%M"), ends.strftime("%Y-%m-%dT%H:%M")
+
+
 def booking_payload(group_id="GR-TEST001"):
+    starts, ends = future_visit_window()
     return {
         "groupEventId": group_id,
         "organizationName": "Demo Visiting School",
@@ -30,8 +40,8 @@ def booking_payload(group_id="GR-TEST001"):
         "hostName": "Morgan Lee",
         "destination": "Science Centre",
         "purpose": "Robotics exchange visit",
-        "startsAtLocal": "2026-10-18T09:30",
-        "endsAtLocal": "2026-10-18T12:00",
+        "startsAtLocal": starts,
+        "endsAtLocal": ends,
         "rosterMembers": [
             {"personType": "Student", "displayName": "Ava Reed", "externalId": "STU-DEMO-01", "affiliation": "Grade 6A"},
             {"personType": "Guardian", "displayName": "Olivia Reed", "externalId": "GDN-DEMO-01", "affiliation": "Parent", "guardianOf": "Ava Reed", "contactHint": "ending 1122"},
@@ -74,8 +84,7 @@ class GroupVisitStoreTests(unittest.TestCase):
 
     def test_group_qr_is_opaque_hash_only_and_rotation_revokes_old_pass(self):
         payload = booking_payload("GR-QRTEST1")
-        payload["startsAtLocal"] = "2026-10-19T09:30"
-        payload["endsAtLocal"] = "2026-10-19T12:00"
+        payload["startsAtLocal"], payload["endsAtLocal"] = future_visit_window()
         created = self.store.create_booking(payload)
         raw_token = created["groupQrToken"]
         self.assertNotIn("groupQrToken", self.store.get_booking("GR-QRTEST1"))
@@ -261,8 +270,7 @@ class GroupVisitApiTests(unittest.TestCase):
 
     def test_group_qr_api_issues_validates_rotates_and_renders_svg(self):
         payload = booking_payload("GR-APIQR001")
-        payload["startsAtLocal"] = "2026-10-19T09:30"
-        payload["endsAtLocal"] = "2026-10-19T12:00"
+        payload["startsAtLocal"], payload["endsAtLocal"] = future_visit_window()
         code, created = self.request("POST", "/api/v1/group-visits", payload)
         self.assertEqual(code, 201)
         token = created["group"]["groupQrToken"]

@@ -33,7 +33,9 @@ Provision the connection profile once with `Save-GenetecCredentials.ps1`. The pr
 
 Normal bridge startup is **non-interactive**. Use `Start-Bridge.cmd` to launch with a double-click, or invoke `Start-Bridge.ps1` directly. Server, username, certificate value and password are loaded from the saved profile and supplied to the child process only while it runs, then cleared. Missing SDK/build prerequisites produce an immediate error instead of an interactive prompt.
 
-The default is read-only. There are no startup confirmation prompts. For approved non-production testing using synthetic records, enable a scope explicitly:
+The default manual bridge launch is read-only. Feature scopes are selected with explicit command-line switches, not environment-variable flags. The automatic VMS developer launcher enables the three guarded development scopes (one fixed synthetic test Cardholder, invited VMS Visitor create/update, and synthetic visitor check-in/checkout) plus the approved read-only Cardholder photo/credential-reference scope using explicit command-line acknowledgement switches. These still require request-level confirmation, synthetic ID restrictions, Directory version/license checks and SDK privileges; use only on a designated test Directory or with approved synthetic test records.
+
+For manual launches, choose the scope explicitly:
 
 - `Start-Bridge-VisitorSync.cmd` — one-click, non-interactive launch with invited Visitor create/update enabled.
 - `Start-Bridge.cmd -EnableVisitorSync` — same invited Visitor create/update scope when using the general launcher.
@@ -100,7 +102,7 @@ For the UI flow, open `Start-Demo.cmd`, select **Genetec bridge → Test local b
 
 ## Guarded native Visitor lifecycle (Day 2 candidate)
 
-`POST /api/genetec/visitor-lifecycle` is disabled unless `GENETEC_ENABLE_VISITOR_LIFECYCLE_SYNC=1` was explicitly enabled at startup on an approved non-production Directory. It accepts only `VMS-SDKTEST-*` test harness bookings or strictly shaped prototype-generated `VMS-UI-XXXXXX` bookings, requires a separately confirmed request, validates the booking resolves to exactly one active native Visitor via a Directory query, checks the CheckInVisitors/CheckOutVisitors privilege, and stores stable event IDs and verified results in `%LOCALAPPDATA%\StamfordVMS\GenetecBridge\visitor-lifecycle-ledger.json`.
+`POST /api/genetec/visitor-lifecycle` is disabled unless the bridge was started with `-EnableVisitorLifecycleSync` (mapped to the `--enable-visitor-lifecycle-sync` bridge argument) on an approved test Directory. It accepts only `VMS-SDKTEST-*` test harness bookings or strictly shaped prototype-generated `VMS-UI-XXXXXX` bookings, requires a separately confirmed request, validates the booking resolves to exactly one active native Visitor via a Directory query, checks the CheckInVisitors/CheckOutVisitors privilege, and stores stable event IDs and verified results in `%LOCALAPPDATA%\StamfordVMS\GenetecBridge\visitor-lifecycle-ledger.json`.
 
 For check-in, the candidate SDK path calls `Visitor.Status.Activate(eventTime)` and sets `Visitor.Arrival` to the same event time, then requires a fresh SDK session to report `Status.ActivationType=SpecificDate` and a matching `Status.ActivationDate`. For checkout, it invokes `Visitor.Checkout()` and requires an archived `CheckedOut` record with native check-in and checkout timestamps. These mappings must be verified by `Test-NativeVisitorLifecycle.ps1` against a designated non-production Security Center 5.11 Directory before being treated as accepted. The capability flag `lifecycleOperationMappingVerified` is only set after both event types pass read-back. On the tested Directory, the active entity's raw `Visitor.CheckinDate` can mirror creation time even while Security Desk still offers **Check in**; lookup output therefore reports that field as `rawEntityCheckinDateUtc` for diagnostics, while canonical active check-in state is derived from `Status.ActivationType/ActivationDate`.
 
@@ -118,3 +120,13 @@ Checkout read-back is treated as eventually consistent: after `Visitor.Checkout(
 ### Scoped student roster metadata import
 
 `GET /api/genetec/student-roster?externalIdPrefix=STU-&limit=1000` is an approval-gated, read-only query. It returns only Cardholders whose supported Student/External ID field begins with the supplied prefix, enforces a 10,000-entity scan cap and a 1,000-result cap, returns masked credential references, and never returns portrait bytes. Do not use a prefix that also includes staff or visitors. It does not perform face identification or write attendance to Genetec.
+
+## Explicit Cardholder photo/credential-reference lookup scope
+
+Cardholder search/photo/credential-reference endpoints remain disabled by default because they expose student/staff identity data. After written school approval and the appropriate person-specific consent/purpose controls are recorded, launch manually with all three switches:
+
+```powershell
+.\Start-Bridge.ps1 -EnableCardholderFaceSync -ConfirmBiometricPolicyApproved -ConfirmGenetecCardholderFaceSyncApproval
+```
+
+This uses direct command-line switches rather than `STAMFORD_*` environment-variable flags. Supplying the switches is an operator acknowledgement only; it does not prove or replace the underlying written school approval or consent records. The approved developer auto-launch profile enables this sensitive read-only data scope through the three explicit command-line acknowledgement switches; it does not perform photo writes or create biometric templates.

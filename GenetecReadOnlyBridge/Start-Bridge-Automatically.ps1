@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 $baseUrl = 'http://127.0.0.1:5190'
-$expectedBridgeBuild = '5.2.4'
+$expectedBridgeBuild = '5.2.8'
 $bridgeDir = $PSScriptRoot
 $startScript = Join-Path $bridgeDir 'Start-Bridge.ps1'
 $exe = Join-Path $bridgeDir 'bin\Debug\GenetecReadOnlyBridge.exe'
@@ -60,18 +60,27 @@ $forceBuild = $false
 # only when the process owning 5190 is exactly GenetecReadOnlyBridge.exe.
 if (Test-BridgeListener) {
     $health = Get-BridgeHealth
-    if ($health -and [string]$health.bridgeBuild -eq $expectedBridgeBuild) {
-        $status = Get-GenetecStatus
-        if ($status -and $status.connected -eq $true) {
-            Write-Host ("Genetec already connected at {0} (bridge build {1}, Directory {2}); reusing current bridge." -f $baseUrl, $health.bridgeBuild, $status.directoryVersion)
-        } else {
-            Write-Warning 'The current bridge build is correct, but its Genetec session is not verified. Not starting a duplicate; inspect bridge logs if it remains disconnected.'
-        }
+    $status = Get-GenetecStatus
+    $requiredScopesEnabled = $health -and
+        $health.testCardholderWriteEnabled -eq $true -and
+        $health.visitorSyncEnabled -eq $true -and
+        $health.visitorLifecycleSyncEnabled -eq $true -and
+        $health.cardholderFaceSyncEnabled -eq $true
+    $bridgeBuildMatches = $health -and [string]$health.bridgeBuild -eq $expectedBridgeBuild
+    if ($bridgeBuildMatches -and $requiredScopesEnabled -and $status -and $status.connected -eq $true) {
+        Write-Host ("Genetec already connected at {0} (bridge build {1}, Directory {2}); guarded developer scopes verified and current bridge reused." -f $baseUrl, $health.bridgeBuild, $status.directoryVersion)
         exit 0
     }
-    Write-Warning ("A stale or unversioned bridge is responding on 5190 (reported build: {0}; expected: {1}). Restarting the Stamford VMS bridge so the current fix is loaded." -f $(if ($health) { $health.bridgeBuild } else { 'unavailable' }), $expectedBridgeBuild)
+
+    if (-not $bridgeBuildMatches) {
+        Write-Warning ("A stale or unversioned bridge is responding on 5190 (reported build: {0}; expected: {1}). Restarting the Stamford VMS bridge so the current startup-scope fix is loaded." -f $(if ($health) { $health.bridgeBuild } else { 'unavailable' }), $expectedBridgeBuild)
+    } elseif (-not $requiredScopesEnabled) {
+        Write-Warning 'The bridge build is current but one or more guarded developer scopes are disabled. Restarting the Stamford bridge with explicit command-line scope switches.'
+    } else {
+        Write-Warning 'The bridge build and requested scopes are current, but the Genetec session is not verified. Restarting the owned Stamford bridge so connection and scopes are re-probed.'
+    }
     if (-not (Stop-StalePrototypeBridge $health)) { exit 0 }
-    $forceBuild = $true
+    $forceBuild = -not $bridgeBuildMatches
 }
 
 # Missing local prerequisites must not prevent the VMS UI from opening.
@@ -138,7 +147,7 @@ if ($forceBuild -or -not (Test-Path $exe)) {
 }
 
 $powershellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}" -EnableVisitorSync -EnableVisitorLifecycleSync' -f $startScript
+$arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}" -EnableTestCardholderWrites -EnableVisitorSync -EnableVisitorLifecycleSync -EnableCardholderFaceSync -ConfirmBiometricPolicyApproved -ConfirmGenetecCardholderFaceSyncApproval' -f $startScript
 
 try {
     $proc = Start-Process -FilePath $powershellExe -ArgumentList $arguments -WorkingDirectory $bridgeDir -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
@@ -152,8 +161,13 @@ for ($i = 0; $i -lt 15; $i++) {
     Start-Sleep -Seconds 1
     if (Test-BridgeListener) {
         $status = Get-GenetecStatus
-        if ($status -and $status.connected -eq $true) {
-            Write-Host ("Genetec connected automatically (Directory {0}). Bridge runs in the background. Logs: {1}" -f $status.directoryVersion, $stdout)
+        $health = Get-BridgeHealth
+        if ($status -and $status.connected -eq $true -and $health -and
+            $health.testCardholderWriteEnabled -eq $true -and
+            $health.visitorSyncEnabled -eq $true -and
+            $health.visitorLifecycleSyncEnabled -eq $true -and
+            $health.cardholderFaceSyncEnabled -eq $true) {
+            Write-Host ("Genetec connected automatically (Directory {0}); guarded test-cardholder, visitor-sync, synthetic lifecycle and approved Cardholder photo lookup scopes verified. Bridge logs: {1}" -f $status.directoryVersion, $stdout)
             exit 0
         }
     }
